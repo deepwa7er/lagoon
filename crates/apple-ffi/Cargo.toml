@@ -1,0 +1,28 @@
+[package]
+name = "buoy-apple-ffi"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "buoy_apple_ffi"
+# `staticlib` is what the iOS and macOS app bundles link against (one slice per
+# Apple target, combined into an xcframework). uniffi-bindgen reads the
+# embedded metadata from the same `.a` to generate the Swift bindings.
+crate-type = ["staticlib"]
+
+[dependencies]
+buoy-core = { path = "../core" }
+thiserror = "2"
+uniffi = { version = "0.28", features = ["cli"] }
+
+# A workspace-local uniffi-bindgen so the bindgen always matches the runtime
+# version of uniffi we depend on.
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[lints]
+workspace = true
