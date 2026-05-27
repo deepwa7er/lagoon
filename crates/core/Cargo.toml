@@ -8,7 +8,7 @@ license.workspace = true
 
 [lib]
 name = "buoy_core"
-crate-type = ["rlib"]
+crate-type = ["rlib", "staticlib"]
 
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }

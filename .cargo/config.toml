@@ -1,0 +1,33 @@
+# Cross-compilation settings for the workspace.
+#
+# Apple targets use Xcode's bundled clang and are configured automatically.
+# Linux targets cross-compile from macOS using the musl-cross toolchain
+# from the `filosottile/macos-cross-toolchains` Homebrew tap:
+#
+#     brew tap filosottile/musl-cross
+#     brew install filosottile/musl-cross/musl-cross
+#
+# This is used as a CI / compile-time guard rail only. The Linux GTK app
+# is built natively on a Linux machine; cross-compiling here just catches
+# Linux-breaking changes during macOS development.
+#
+# We intentionally do NOT use cargo-zigbuild: Zig 0.16's bundled `ar`
+# cannot create new archives, which `rusqlite`'s bundled SQLite needs.
+
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+ar = "x86_64-linux-musl-ar"
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"
+ar = "aarch64-linux-musl-ar"
+
+# cc-rs (used by libsqlite3-sys for the bundled SQLite build) picks up
+# CC_<target> and AR_<target> environment variables. These mirror the
+# linker/ar settings above so the C build of SQLite uses the same
+# cross-toolchain.
+[env]
+CC_x86_64-unknown-linux-musl = "x86_64-linux-musl-gcc"
+AR_x86_64-unknown-linux-musl = "x86_64-linux-musl-ar"
+CC_aarch64-unknown-linux-musl = "aarch64-linux-musl-gcc"
+AR_aarch64-unknown-linux-musl = "aarch64-linux-musl-ar"
