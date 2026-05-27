@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/apple-ffi", "crates/core"]
+members = ["crates/apple-ffi", "crates/core", "crates/linux"]
 
 [workspace.package]
 edition = "2024"

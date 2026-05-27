@@ -59,6 +59,16 @@ build-linux:
         cargo build --lib -p buoy-core --release --target "$t"
     done
 
+# Build the Linux GTK app natively (requires GTK4 + pkg-config in PATH).
+# On macOS hosts this requires `brew install gtk4`. On Linux, install the
+# distro's GTK4 development packages.
+build-linux-app:
+    cargo build -p buoy-linux --release
+
+# Run the Linux GTK app natively on the host.
+run-linux:
+    cargo run -p buoy-linux
+
 # Generate Swift bindings via the workspace-local uniffi-bindgen.
 # Depends on having a built apple-ffi static lib for `bindgen_target`.
 build-bindings:
