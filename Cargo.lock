@@ -154,6 +154,7 @@ dependencies = [
  "buoy-core",
  "thiserror 2.0.18",
  "uniffi",
+ "uuid",
 ]
 
 [[package]]
@@ -172,6 +173,7 @@ version = "0.1.0"
 dependencies = [
  "buoy-core",
  "gtk4",
+ "uuid",
 ]
 
 [[package]]

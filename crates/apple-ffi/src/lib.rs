@@ -15,16 +15,21 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use buoy_core::{Error as CoreError, Thought as CoreThought, ThoughtStore as CoreStore};
+use uuid::Uuid;
 
 uniffi::setup_scaffolding!();
 
 /// Swift-facing thought record. `id` is the UUID as a lowercase hyphenated
-/// string; `created_at` is milliseconds since the epoch (1970-01-01 UTC).
+/// string; timestamps are milliseconds since the epoch (1970-01-01 UTC).
 #[derive(uniffi::Record)]
 pub struct Thought {
     pub id: String,
     pub text: String,
     pub created_at: i64,
+    pub updated_at: i64,
+    /// True when this thought has settled — subsequent edits will create
+    /// edit-history entries rather than silently overwriting.
+    pub is_settled: bool,
 }
 
 impl From<CoreThought> for Thought {
@@ -33,6 +38,8 @@ impl From<CoreThought> for Thought {
             id: value.id.to_string(),
             text: value.text,
             created_at: value.created_at,
+            updated_at: value.updated_at,
+            is_settled: value.is_settled,
         }
     }
 }
@@ -43,14 +50,27 @@ impl From<CoreThought> for Thought {
 pub enum FfiError {
     #[error("storage error: {message}")]
     Storage { message: String },
+    #[error("invalid id: {message}")]
+    InvalidId { message: String },
+    #[error("not found")]
+    NotFound,
 }
 
 impl From<CoreError> for FfiError {
     fn from(value: CoreError) -> Self {
-        Self::Storage {
-            message: value.to_string(),
+        match value {
+            CoreError::NotFound { .. } => Self::NotFound,
+            other => Self::Storage {
+                message: other.to_string(),
+            },
         }
     }
+}
+
+fn parse_id(id: &str) -> Result<Uuid, FfiError> {
+    Uuid::parse_str(id).map_err(|err| FfiError::InvalidId {
+        message: err.to_string(),
+    })
 }
 
 /// Swift-facing wrapper around the core `ThoughtStore`.
@@ -81,6 +101,33 @@ impl ThoughtStore {
     pub fn create(&self, text: &str) -> Result<Thought, FfiError> {
         let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
         Ok(guard.create(text)?.into())
+    }
+
+    /// Replace the text of an existing thought. If the thought is settled
+    /// at the moment of the edit, the prior text is captured into the
+    /// edit history before the update lands.
+    pub fn update(&self, id: &str, text: &str) -> Result<Thought, FfiError> {
+        let uuid = parse_id(id)?;
+        let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
+        Ok(guard.update_thought(uuid, text)?.into())
+    }
+
+    /// Delete a thought and its edit history.
+    pub fn delete(&self, id: &str) -> Result<(), FfiError> {
+        let uuid = parse_id(id)?;
+        let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
+        guard.delete_thought(uuid)?;
+        Ok(())
+    }
+
+    /// Force every currently-live thought into the settled state. The
+    /// platform layer calls this when the app moves to the background,
+    /// so a returning user's next edit is treated as a deliberate
+    /// modification rather than a continuation of the live session.
+    pub fn settle_all_live(&self) -> Result<(), FfiError> {
+        let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
+        guard.settle_all_live()?;
+        Ok(())
     }
 
     /// Return every stored thought, newest first.

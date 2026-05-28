@@ -1,9 +1,12 @@
 //! Buoy — Linux GTK4 client.
 //!
 //! Depends on `buoy-core` directly (Rust -> Rust, no FFI). The UI mirrors
-//! the iOS/macOS apps: a list of thoughts with newest at the bottom, and a
-//! composer below the divider that submits on Enter or on clicking Save.
+//! the iOS/macOS apps: a list of thoughts with newest at the bottom, a
+//! composer below the divider that submits on Enter or on clicking Save,
+//! and an edit-mode banner that appears when a stream row has been
+//! tapped to edit.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,9 +15,11 @@ use buoy_core::{Thought, ThoughtStore};
 use gtk::glib::{self, Propagation};
 use gtk::prelude::*;
 use gtk::{
-    Application, ApplicationWindow, Box as GtkBox, Button, EventControllerKey, Label, ListBox,
-    ListBoxRow, Orientation, PropagationPhase, ScrolledWindow, Separator, TextView, WrapMode, gdk,
+    Application, ApplicationWindow, Box as GtkBox, Button, EventControllerKey, Image, Label,
+    ListBox, ListBoxRow, Orientation, PropagationPhase, ScrolledWindow, Separator, TextView,
+    WrapMode, gdk,
 };
+use uuid::Uuid;
 
 const APP_ID: &str = "io.joemafrici.Buoy";
 
@@ -24,6 +29,7 @@ fn main() -> glib::ExitCode {
     app.run()
 }
 
+#[allow(clippy::too_many_lines)] // GTK UI construction is imperative and naturally long.
 fn build_ui(app: &Application) {
     let store = match open_store() {
         Ok(s) => Rc::new(s),
@@ -32,6 +38,8 @@ fn build_ui(app: &Application) {
             std::process::exit(1);
         }
     };
+
+    let editing_id: Rc<RefCell<Option<Uuid>>> = Rc::new(RefCell::new(None));
 
     let list_box = ListBox::new();
     list_box.set_selection_mode(gtk::SelectionMode::None);
@@ -42,9 +50,6 @@ fn build_ui(app: &Application) {
         .child(&list_box)
         .build();
 
-    // Multi-line composer. The TextView lives inside its own ScrolledWindow
-    // so it can start at one line tall and grow up to roughly five lines
-    // before its internal scrollbar takes over.
     let text_view = TextView::builder()
         .wrap_mode(WrapMode::WordChar)
         .top_margin(8)
@@ -67,6 +72,10 @@ fn build_ui(app: &Application) {
     let save_button = Button::with_label("Save");
     save_button.add_css_class("suggested-action");
 
+    // Edit-mode banner: hidden when not editing.
+    let editing_banner = build_editing_banner();
+    editing_banner.set_visible(false);
+
     let composer = GtkBox::builder()
         .orientation(Orientation::Horizontal)
         .spacing(8)
@@ -81,6 +90,7 @@ fn build_ui(app: &Application) {
     let main_box = GtkBox::new(Orientation::Vertical, 0);
     main_box.append(&stream_scroll);
     main_box.append(&Separator::new(Orientation::Horizontal));
+    main_box.append(&editing_banner);
     main_box.append(&composer);
 
     let window = ApplicationWindow::builder()
@@ -91,14 +101,72 @@ fn build_ui(app: &Application) {
         .child(&main_box)
         .build();
 
-    populate_list(&list_box, &store);
-    scroll_to_bottom(&stream_scroll);
+    // start_editing: enter edit mode for the given thought.
+    let start_editing = {
+        let editing_id = Rc::clone(&editing_id);
+        let text_view = text_view.clone();
+        let save_button = save_button.clone();
+        let editing_banner = editing_banner.clone();
+        move |id: Uuid, text: String| {
+            *editing_id.borrow_mut() = Some(id);
+            text_view.buffer().set_text(&text);
+            editing_banner.set_visible(true);
+            save_button.set_label("Update");
+            text_view.grab_focus();
+        }
+    };
 
+    // cancel_editing: leave edit mode and clear the draft.
+    let cancel_editing = {
+        let editing_id = Rc::clone(&editing_id);
+        let text_view = text_view.clone();
+        let save_button = save_button.clone();
+        let editing_banner = editing_banner.clone();
+        move || {
+            *editing_id.borrow_mut() = None;
+            text_view.buffer().set_text("");
+            editing_banner.set_visible(false);
+            save_button.set_label("Save");
+        }
+    };
+
+    // refresh_list: rebuild stream rows, wiring each row's activate signal
+    // to start_editing for its own thought.
+    let refresh_list = {
+        let list_box = list_box.clone();
+        let store = Rc::clone(&store);
+        let start_editing = start_editing.clone();
+        move || {
+            while let Some(child) = list_box.first_child() {
+                list_box.remove(&child);
+            }
+            let thoughts = match store.list() {
+                Ok(t) => t,
+                Err(err) => {
+                    eprintln!("buoy: list failed: {err}");
+                    return;
+                }
+            };
+            for thought in thoughts.into_iter().rev() {
+                let row = make_row(&thought);
+                let start = start_editing.clone();
+                let id = thought.id;
+                let text = thought.text.clone();
+                row.connect_activate(move |_| start(id, text.clone()));
+                list_box.append(&row);
+            }
+        }
+    };
+
+    // save: commit the draft as either a new thought or an update to the
+    // one currently being edited, then refresh.
     let save = {
         let store = Rc::clone(&store);
-        let list_box = list_box.clone();
+        let editing_id = Rc::clone(&editing_id);
         let text_view = text_view.clone();
         let stream_scroll = stream_scroll.clone();
+        let refresh_list = refresh_list.clone();
+        let cancel_editing = cancel_editing.clone();
         move || {
             let buffer = text_view.buffer();
             let raw = buffer
@@ -108,26 +176,48 @@ fn build_ui(app: &Application) {
             if trimmed.is_empty() {
                 return;
             }
-            if let Err(err) = store.create(trimmed) {
+            let current_edit = *editing_id.borrow();
+            let result = match current_edit {
+                Some(id) => store.update_thought(id, trimmed).map(|_| ()),
+                None => store.create(trimmed).map(|_| ()),
+            };
+            if let Err(err) = result {
                 eprintln!("buoy: save failed: {err}");
                 return;
             }
-            buffer.set_text("");
-            populate_list(&list_box, &store);
+            cancel_editing();
+            refresh_list();
             scroll_to_bottom(&stream_scroll);
         }
     };
 
+    refresh_list();
+    scroll_to_bottom(&stream_scroll);
+
+    // Save button.
     let save_for_button = save.clone();
     save_button.connect_clicked(move |_| save_for_button());
 
-    // Capture-phase key handler so we intercept Return before the TextView
-    // inserts a newline. Shift+Return falls through to GTK's default
-    // handling, which adds the newline as the user intended.
+    // Cancel button inside the banner.
+    if let Some(cancel_button) = editing_banner_cancel(&editing_banner) {
+        let cancel = cancel_editing.clone();
+        cancel_button.connect_clicked(move |_| cancel());
+    }
+
+    // Capture-phase key handler on the TextView:
+    //   - bare Return saves
+    //   - Shift+Return inserts a newline (falls through to default)
+    //   - Escape cancels an in-progress edit
     let key_controller = EventControllerKey::new();
     key_controller.set_propagation_phase(PropagationPhase::Capture);
     let save_for_key = save.clone();
+    let cancel_for_key = cancel_editing.clone();
+    let editing_id_for_key = Rc::clone(&editing_id);
     key_controller.connect_key_pressed(move |_, key, _, modifiers| {
+        if key == gdk::Key::Escape && editing_id_for_key.borrow().is_some() {
+            cancel_for_key();
+            return Propagation::Stop;
+        }
         let is_return = key == gdk::Key::Return || key == gdk::Key::KP_Enter;
         if is_return && !modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
             save_for_key();
@@ -139,25 +229,6 @@ fn build_ui(app: &Application) {
 
     window.present();
     text_view.grab_focus();
-}
-
-fn populate_list(list_box: &ListBox, store: &ThoughtStore) {
-    while let Some(child) = list_box.first_child() {
-        list_box.remove(&child);
-    }
-
-    let thoughts = match store.list() {
-        Ok(t) => t,
-        Err(err) => {
-            eprintln!("buoy: list failed: {err}");
-            return;
-        }
-    };
-
-    // Core returns newest-first; reverse for newest-at-bottom UX.
-    for thought in thoughts.into_iter().rev() {
-        list_box.append(&make_row(&thought));
-    }
 }
 
 fn make_row(thought: &Thought) -> ListBoxRow {
@@ -188,8 +259,50 @@ fn make_row(thought: &Thought) -> ListBoxRow {
     let row = ListBoxRow::new();
     row.set_child(Some(&row_box));
     row.set_selectable(false);
-    row.set_activatable(false);
+    row.set_activatable(true);
     row
+}
+
+fn build_editing_banner() -> GtkBox {
+    let icon = Image::from_icon_name("document-edit-symbolic");
+    icon.add_css_class("dim-label");
+
+    let label = Label::builder()
+        .label("Editing thought")
+        .xalign(0.0)
+        .hexpand(true)
+        .build();
+    label.add_css_class("caption");
+    label.add_css_class("dim-label");
+
+    let cancel = Button::with_label("Cancel");
+    cancel.add_css_class("flat");
+    // Tag the cancel button so we can find it again from outside.
+    cancel.set_widget_name("editing-cancel");
+
+    let banner = GtkBox::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+    banner.append(&icon);
+    banner.append(&label);
+    banner.append(&cancel);
+    banner
+}
+
+fn editing_banner_cancel(banner: &GtkBox) -> Option<Button> {
+    let mut child = banner.first_child();
+    while let Some(widget) = child {
+        if widget.widget_name() == "editing-cancel" {
+            return widget.downcast::<Button>().ok();
+        }
+        child = widget.next_sibling();
+    }
+    None
 }
 
 /// Format `created_ms` as a relative time string (e.g. "5 minutes ago")
@@ -227,8 +340,6 @@ fn now_unix_millis() -> i64 {
 }
 
 fn scroll_to_bottom(scrolled: &ScrolledWindow) {
-    // The adjustment's `upper` only reflects the new content after GTK has
-    // laid it out, so defer to the next idle tick before jumping.
     let adjust = scrolled.vadjustment();
     glib::idle_add_local(move || {
         adjust.set_value(adjust.upper());
@@ -287,8 +398,6 @@ mod tests {
 
     #[test]
     fn future_timestamps_render_as_just_now() {
-        // Should never happen with monotonic capture, but the fallback
-        // must be benign rather than panic or render a negative count.
         assert_eq!(at(1_000_000, -(5 * MIN)), "just now");
     }
 }

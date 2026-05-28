@@ -17,6 +17,7 @@ crate-type = ["staticlib"]
 buoy-core = { path = "../core" }
 thiserror = "2"
 uniffi = { version = "0.28", features = ["cli"] }
+uuid = "1"
 
 # A workspace-local uniffi-bindgen so the bindgen always matches the runtime
 # version of uniffi we depend on.

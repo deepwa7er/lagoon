@@ -11,8 +11,13 @@ final class ThoughtListModel {
     var thoughts: [Thought] = []
     var draft: String = ""
     var errorMessage: String?
+    /// When non-nil, `save` will update the existing thought instead of
+    /// creating a new one. Cleared on save or cancel.
+    var editingId: String?
 
     private var store: ThoughtStore?
+
+    var isEditing: Bool { editingId != nil }
 
     func open() async {
         do {
@@ -33,12 +38,27 @@ final class ThoughtListModel {
         }
     }
 
+    func startEditing(_ thought: Thought) {
+        draft = thought.text
+        editingId = thought.id
+    }
+
+    func cancelEditing() {
+        draft = ""
+        editingId = nil
+    }
+
     func save() async {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, let store else { return }
         do {
-            _ = try store.create(text: text)
+            if let id = editingId {
+                _ = try store.update(id: id, text: text)
+            } else {
+                _ = try store.create(text: text)
+            }
             draft = ""
+            editingId = nil
             await refresh()
         } catch {
             errorMessage = "Failed to save thought: \(error.localizedDescription)"
@@ -63,7 +83,7 @@ struct ContentView: View {
     @State private var model = ThoughtListModel()
     @FocusState private var composerFocused: Bool
     #if os(macOS)
-    @State private var returnMonitor: Any?
+    @State private var keyMonitor: Any?
     #endif
 
     var body: some View {
@@ -71,12 +91,21 @@ struct ContentView: View {
             List {
                 ForEach(Array(model.thoughts.reversed()), id: \.id) { thought in
                     ThoughtRow(thought: thought)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            model.startEditing(thought)
+                            composerFocused = true
+                        }
                 }
             }
             .listStyle(.plain)
             .defaultScrollAnchor(.bottom)
 
             Divider()
+
+            if model.isEditing {
+                EditingBanner(onCancel: { model.cancelEditing() })
+            }
 
             HStack(alignment: .bottom, spacing: 8) {
                 ZStack(alignment: .topLeading) {
@@ -89,7 +118,7 @@ struct ContentView: View {
                         })
 
                     if model.draft.isEmpty {
-                        Text("What's on your mind?")
+                        Text(model.isEditing ? "" : "What's on your mind?")
                             .foregroundStyle(.tertiary)
                             .padding(.leading, 5)
                             .padding(.top, 8)
@@ -97,7 +126,7 @@ struct ContentView: View {
                     }
                 }
 
-                Button("Save") {
+                Button(model.isEditing ? "Update" : "Save") {
                     Task { await model.save() }
                 }
                 .disabled(model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -109,8 +138,8 @@ struct ContentView: View {
             composerFocused = true
         }
         #if os(macOS)
-        .onAppear { installReturnMonitor() }
-        .onDisappear { removeReturnMonitor() }
+        .onAppear { installKeyMonitor() }
+        .onDisappear { removeKeyMonitor() }
         #endif
         .alert(
             "Error",
@@ -128,14 +157,19 @@ struct ContentView: View {
     }
 
     #if os(macOS)
-    private func installReturnMonitor() {
+    private func installKeyMonitor() {
         // SwiftUI's `.onKeyPress` does not let an `.ignored` Return fall
-        // through to the multi-line TextField's newline insertion, so on
-        // macOS we intercept Return at the AppKit level instead. Bare
-        // Return is consumed and routed to save; Shift+Return is passed
-        // through so the TextField inserts a literal newline.
-        returnMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            // 36 is the main Return key; 76 is the numeric-keypad Enter.
+        // through to the multi-line text editor's newline insertion, so on
+        // macOS we intercept keystrokes at the AppKit level instead. Bare
+        // Return saves; Shift+Return passes through so NSTextView inserts
+        // a literal newline. Escape cancels an in-progress edit.
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // 53 = Escape
+            if event.keyCode == 53 && model.isEditing {
+                model.cancelEditing()
+                return nil
+            }
+            // 36 = Return, 76 = numeric keypad Enter
             guard event.keyCode == 36 || event.keyCode == 76 else { return event }
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             if flags.contains(.shift) {
@@ -146,19 +180,19 @@ struct ContentView: View {
         }
     }
 
-    private func removeReturnMonitor() {
-        if let monitor = returnMonitor {
+    private func removeKeyMonitor() {
+        if let monitor = keyMonitor {
             NSEvent.removeMonitor(monitor)
-            returnMonitor = nil
+            keyMonitor = nil
         }
     }
     #endif
 }
 
 /// Bare Return submits; Shift+Return inserts a newline. On macOS this is
-/// handled at the AppKit level (see `installReturnMonitor`), so the
-/// modifier is a no-op there to avoid SwiftUI's surprising `.onKeyPress`
-/// behavior. iOS has no Shift modifier on the on-screen keyboard, so the
+/// handled at the AppKit level (see `installKeyMonitor`), so the modifier
+/// is a no-op there to avoid SwiftUI's surprising `.onKeyPress` behavior.
+/// iOS has no Shift modifier on the on-screen keyboard, so the
 /// `.onKeyPress` form is sufficient.
 private struct BareReturnSubmits: ViewModifier {
     let action: () -> Void
@@ -175,6 +209,29 @@ private struct BareReturnSubmits: ViewModifier {
             return .handled
         }
         #endif
+    }
+}
+
+private struct EditingBanner: View {
+    let onCancel: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "pencil")
+                .imageScale(.small)
+                .foregroundStyle(.secondary)
+            Text("Editing thought")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("Cancel", action: onCancel)
+                .buttonStyle(.plain)
+                .font(.caption)
+                .foregroundStyle(.tint)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color.accentColor.opacity(0.08))
     }
 }
 
