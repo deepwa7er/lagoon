@@ -15,8 +15,8 @@ use buoy_core::{Thought, ThoughtStore};
 use gtk::glib::{self, Propagation};
 use gtk::prelude::*;
 use gtk::{
-    Application, ApplicationWindow, Box as GtkBox, Button, EventControllerKey, Image, Label,
-    ListBox, ListBoxRow, Orientation, PropagationPhase, ScrolledWindow, Separator, TextView,
+    Application, ApplicationWindow, Box as GtkBox, Button, EventControllerKey, GestureClick, Image,
+    Label, ListBox, ListBoxRow, Orientation, PropagationPhase, ScrolledWindow, Separator, TextView,
     WrapMode, gdk,
 };
 use uuid::Uuid;
@@ -149,10 +149,19 @@ fn build_ui(app: &Application) {
             };
             for thought in thoughts.into_iter().rev() {
                 let row = make_row(&thought);
+
+                // ListBoxRow's `activate` signal is unreliable for plain
+                // mouse clicks in GTK4. Attach an explicit GestureClick so
+                // single-clicks on any part of the row enter edit mode.
+                let click = GestureClick::new();
                 let start = start_editing.clone();
                 let id = thought.id;
                 let text = thought.text.clone();
-                row.connect_activate(move |_| start(id, text.clone()));
+                click.connect_released(move |_, _, _, _| {
+                    start(id, text.clone());
+                });
+                row.add_controller(click);
+
                 list_box.append(&row);
             }
         }
@@ -259,7 +268,9 @@ fn make_row(thought: &Thought) -> ListBoxRow {
     let row = ListBoxRow::new();
     row.set_child(Some(&row_box));
     row.set_selectable(false);
-    row.set_activatable(true);
+    // We don't want the row's own activation behavior; clicks are handled
+    // by a per-row GestureClick controller installed at refresh time.
+    row.set_activatable(false);
     row
 }
 
