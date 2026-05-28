@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use uuid::Uuid;
+
 /// Errors produced by the Buoy core.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -19,6 +21,10 @@ pub enum Error {
     /// Indicates corruption or an out-of-sync schema, not a user error.
     #[error("corrupt row in `{table}`: {detail}")]
     CorruptRow { table: &'static str, detail: String },
+
+    /// No thought with the given id exists.
+    #[error("no thought with id {id}")]
+    NotFound { id: Uuid },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

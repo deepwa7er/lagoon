@@ -9,5 +9,5 @@ mod store;
 mod thought;
 
 pub use error::{Error, Result};
-pub use store::ThoughtStore;
-pub use thought::Thought;
+pub use store::{Cursor, DEFAULT_PAGE_SIZE, Page, ThoughtStore};
+pub use thought::{EditEntry, Thought};
