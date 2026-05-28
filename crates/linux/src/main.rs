@@ -9,11 +9,11 @@ use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use buoy_core::{Thought, ThoughtStore};
-use gtk::glib;
+use gtk::glib::{self, Propagation};
 use gtk::prelude::*;
 use gtk::{
-    Application, ApplicationWindow, Box as GtkBox, Button, Entry, Label, ListBox, ListBoxRow,
-    Orientation, ScrolledWindow, Separator,
+    Application, ApplicationWindow, Box as GtkBox, Button, EventControllerKey, Label, ListBox,
+    ListBoxRow, Orientation, PropagationPhase, ScrolledWindow, Separator, TextView, WrapMode, gdk,
 };
 
 const APP_ID: &str = "io.joemafrici.Buoy";
@@ -36,15 +36,32 @@ fn build_ui(app: &Application) {
     let list_box = ListBox::new();
     list_box.set_selection_mode(gtk::SelectionMode::None);
 
-    let scrolled = ScrolledWindow::builder()
+    let stream_scroll = ScrolledWindow::builder()
         .vexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .child(&list_box)
         .build();
 
-    let entry = Entry::builder()
-        .placeholder_text("What's on your mind?")
+    // Multi-line composer. The TextView lives inside its own ScrolledWindow
+    // so it can start at one line tall and grow up to roughly five lines
+    // before its internal scrollbar takes over.
+    let text_view = TextView::builder()
+        .wrap_mode(WrapMode::WordChar)
+        .top_margin(8)
+        .bottom_margin(8)
+        .left_margin(8)
+        .right_margin(8)
         .hexpand(true)
+        .build();
+
+    let composer_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .min_content_height(40)
+        .max_content_height(140)
+        .hexpand(true)
+        .child(&text_view)
         .build();
 
     let save_button = Button::with_label("Save");
@@ -58,11 +75,11 @@ fn build_ui(app: &Application) {
         .margin_top(8)
         .margin_bottom(8)
         .build();
-    composer.append(&entry);
+    composer.append(&composer_scroll);
     composer.append(&save_button);
 
     let main_box = GtkBox::new(Orientation::Vertical, 0);
-    main_box.append(&scrolled);
+    main_box.append(&stream_scroll);
     main_box.append(&Separator::new(Orientation::Horizontal));
     main_box.append(&composer);
 
@@ -75,16 +92,19 @@ fn build_ui(app: &Application) {
         .build();
 
     populate_list(&list_box, &store);
-    scroll_to_bottom(&scrolled);
+    scroll_to_bottom(&stream_scroll);
 
     let save = {
         let store = Rc::clone(&store);
         let list_box = list_box.clone();
-        let entry = entry.clone();
-        let scrolled = scrolled.clone();
+        let text_view = text_view.clone();
+        let stream_scroll = stream_scroll.clone();
         move || {
-            let text = entry.text();
-            let trimmed = text.trim();
+            let buffer = text_view.buffer();
+            let raw = buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                .to_string();
+            let trimmed = raw.trim();
             if trimmed.is_empty() {
                 return;
             }
@@ -92,18 +112,33 @@ fn build_ui(app: &Application) {
                 eprintln!("buoy: save failed: {err}");
                 return;
             }
-            entry.set_text("");
+            buffer.set_text("");
             populate_list(&list_box, &store);
-            scroll_to_bottom(&scrolled);
+            scroll_to_bottom(&stream_scroll);
         }
     };
 
     let save_for_button = save.clone();
     save_button.connect_clicked(move |_| save_for_button());
-    entry.connect_activate(move |_| save());
+
+    // Capture-phase key handler so we intercept Return before the TextView
+    // inserts a newline. Shift+Return falls through to GTK's default
+    // handling, which adds the newline as the user intended.
+    let key_controller = EventControllerKey::new();
+    key_controller.set_propagation_phase(PropagationPhase::Capture);
+    let save_for_key = save.clone();
+    key_controller.connect_key_pressed(move |_, key, _, modifiers| {
+        let is_return = key == gdk::Key::Return || key == gdk::Key::KP_Enter;
+        if is_return && !modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
+            save_for_key();
+            return Propagation::Stop;
+        }
+        Propagation::Proceed
+    });
+    text_view.add_controller(key_controller);
 
     window.present();
-    entry.grab_focus();
+    text_view.grab_focus();
 }
 
 fn populate_list(list_box: &ListBox, store: &ThoughtStore) {

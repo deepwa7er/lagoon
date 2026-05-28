@@ -71,11 +71,19 @@ struct ContentView: View {
 
             Divider()
 
-            HStack(alignment: .center, spacing: 8) {
-                TextField("What's on your mind?", text: $model.draft)
+            HStack(alignment: .bottom, spacing: 8) {
+                TextField("What's on your mind?", text: $model.draft, axis: .vertical)
                     .textFieldStyle(.plain)
+                    .lineLimit(1...8)
                     .focused($composerFocused)
-                    .onSubmit { Task { await model.save() } }
+                    .onKeyPress(keys: [.return]) { keyPress in
+                        // Shift+Return inserts a literal newline; bare Return saves.
+                        if keyPress.modifiers.contains(.shift) {
+                            return .ignored
+                        }
+                        Task { await model.save() }
+                        return .handled
+                    }
 
                 Button("Save") {
                     Task { await model.save() }
