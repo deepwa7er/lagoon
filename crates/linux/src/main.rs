@@ -17,8 +17,8 @@ use gtk::glib::{self, Propagation};
 use gtk::prelude::*;
 use gtk::{
     Application, ApplicationWindow, Box as GtkBox, Button, EventControllerKey, GestureClick, Image,
-    Label, ListBox, ListBoxRow, Orientation, PropagationPhase, ScrolledWindow, SearchEntry,
-    Separator, Stack, TextView, WrapMode, gdk, pango,
+    Label, ListBox, ListBoxRow, Orientation, Popover, PropagationPhase, ScrolledWindow,
+    SearchEntry, Separator, Stack, TextView, WrapMode, gdk, pango,
 };
 use uuid::Uuid;
 
@@ -26,6 +26,16 @@ const APP_ID: &str = "io.joemafrici.Buoy";
 
 /// Upper bound on search results shown for one query.
 const MAX_SEARCH_RESULTS: usize = 50;
+
+/// How many related thoughts the suggestion strip and the per-row
+/// related popover show.
+const RELATED_COUNT: usize = 3;
+
+/// Jump-to-thought callback, late-bound because stream rows are built by
+/// machinery that `reveal_thought` itself depends on (loading older pages
+/// rebuilds rows). Rows capture the cell; it is filled in once the reveal
+/// closure exists.
+type RevealCell = Rc<RefCell<Option<Rc<dyn Fn(Uuid)>>>>;
 
 fn main() -> glib::ExitCode {
     let app = Application::builder().application_id(APP_ID).build();
@@ -130,11 +140,35 @@ fn build_ui(app: &Application) {
     stack.add_named(&stream_scroll, Some("stream"));
     stack.add_named(&results_scroll, Some("results"));
 
+    // Suggestion strip: related past thoughts for the in-progress draft.
+    // Passive by design — plain chips below the stream that never take
+    // focus from the composer. Hidden until a draft produces matches.
+    let suggestion_chips = GtkBox::new(Orientation::Horizontal, 6);
+    suggestion_chips.set_hexpand(true);
+    let suggestion_dismiss = Button::from_icon_name("window-close-symbolic");
+    suggestion_dismiss.add_css_class("flat");
+    suggestion_dismiss.set_tooltip_text(Some("Hide suggestions"));
+    let suggestion_icon = Image::from_icon_name("insert-link-symbolic");
+    suggestion_icon.add_css_class("dim-label");
+    let suggestion_strip = GtkBox::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(6)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(4)
+        .margin_bottom(4)
+        .build();
+    suggestion_strip.append(&suggestion_icon);
+    suggestion_strip.append(&suggestion_chips);
+    suggestion_strip.append(&suggestion_dismiss);
+    suggestion_strip.set_visible(false);
+
     let main_box = GtkBox::new(Orientation::Vertical, 0);
     main_box.append(&search_entry);
     main_box.append(&Separator::new(Orientation::Horizontal));
     main_box.append(&stack);
     main_box.append(&Separator::new(Orientation::Horizontal));
+    main_box.append(&suggestion_strip);
     main_box.append(&editing_banner);
     main_box.append(&composer);
 
@@ -189,14 +223,20 @@ fn build_ui(app: &Application) {
         }
     };
 
-    // make_wired_row: build a stream row with its tap-to-edit gesture.
-    // ListBoxRow's `activate` signal is unreliable for plain mouse clicks
-    // in GTK4, so each row gets an explicit GestureClick that enters edit
-    // mode for its own thought.
+    // Late-bound jump-to-thought hook for rows and suggestion chips; see
+    // RevealCell. Filled in after reveal_thought is built below.
+    let reveal_cell: RevealCell = Rc::new(RefCell::new(None));
+
+    // make_wired_row: build a stream row with its tap-to-edit gesture and
+    // related-thoughts popover. ListBoxRow's `activate` signal is
+    // unreliable for plain mouse clicks in GTK4, so each row gets an
+    // explicit GestureClick that enters edit mode for its own thought.
     let make_wired_row = {
         let start_editing = start_editing.clone();
+        let store = Rc::clone(&store);
+        let reveal_cell = Rc::clone(&reveal_cell);
         move |thought: &Thought| -> ListBoxRow {
-            let row = make_row(thought);
+            let (row, related_button) = make_row(thought);
             let click = GestureClick::new();
             let start = start_editing.clone();
             let id = thought.id;
@@ -205,6 +245,12 @@ fn build_ui(app: &Application) {
                 start(id, text.clone());
             });
             row.add_controller(click);
+
+            let store = Rc::clone(&store);
+            let reveal_cell = Rc::clone(&reveal_cell);
+            related_button.connect_clicked(move |button| {
+                show_related_popover(button, &store, id, &reveal_cell);
+            });
             row
         }
     };
@@ -324,6 +370,113 @@ fn build_ui(app: &Application) {
         }
     };
 
+    // Rows and suggestion chips jump to thoughts through the late-bound
+    // cell now that the reveal closure exists.
+    {
+        let reveal: Rc<dyn Fn(Uuid)> = Rc::new(reveal_thought.clone());
+        *reveal_cell.borrow_mut() = Some(reveal);
+    }
+
+    // update_suggestions: recompute the strip for the current draft.
+    // Failures are silent by design — the strip is an enhancement — and
+    // find_related is already empty for blank drafts or no embedder.
+    let dismissed_draft: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let update_suggestions = {
+        let store = Rc::clone(&store);
+        let text_view = text_view.clone();
+        let editing_id = Rc::clone(&editing_id);
+        let composer = composer.clone();
+        let suggestion_chips = suggestion_chips.clone();
+        let suggestion_strip = suggestion_strip.clone();
+        let dismissed_draft = Rc::clone(&dismissed_draft);
+        let reveal_cell = Rc::clone(&reveal_cell);
+        move || {
+            // While searching the composer is hidden; no suggestions.
+            if !composer.is_visible() {
+                suggestion_strip.set_visible(false);
+                return;
+            }
+            let buffer = text_view.buffer();
+            let draft = buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                .to_string();
+            if dismissed_draft.borrow().as_deref() == Some(draft.as_str()) {
+                suggestion_strip.set_visible(false);
+                return;
+            }
+            *dismissed_draft.borrow_mut() = None;
+
+            let exclude = *editing_id.borrow();
+            let matches = store
+                .find_related(&draft, RELATED_COUNT, exclude)
+                .unwrap_or_default();
+
+            while let Some(child) = suggestion_chips.first_child() {
+                suggestion_chips.remove(&child);
+            }
+            if matches.is_empty() {
+                suggestion_strip.set_visible(false);
+                return;
+            }
+            for found in matches {
+                let chip = Button::builder()
+                    .child(
+                        &Label::builder()
+                            .label(&found.thought.text)
+                            .ellipsize(pango::EllipsizeMode::End)
+                            .max_width_chars(28)
+                            .xalign(0.0)
+                            .build(),
+                    )
+                    .build();
+                chip.add_css_class("flat");
+                let reveal_cell = Rc::clone(&reveal_cell);
+                let target = found.thought.id;
+                chip.connect_clicked(move |_| {
+                    if let Some(reveal) = reveal_cell.borrow().as_ref() {
+                        reveal(target);
+                    }
+                });
+                suggestion_chips.append(&chip);
+            }
+            suggestion_strip.set_visible(true);
+        }
+    };
+
+    // Dismiss hides the strip for this exact draft; it returns once the
+    // draft text changes.
+    {
+        let text_view = text_view.clone();
+        let dismissed_draft = Rc::clone(&dismissed_draft);
+        let suggestion_strip = suggestion_strip.clone();
+        suggestion_dismiss.connect_clicked(move |_| {
+            let buffer = text_view.buffer();
+            let draft = buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                .to_string();
+            *dismissed_draft.borrow_mut() = Some(draft);
+            suggestion_strip.set_visible(false);
+        });
+    }
+
+    // Debounced (~200ms) suggestion refresh on every draft keystroke.
+    {
+        let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let update_suggestions = update_suggestions.clone();
+        text_view.buffer().connect_changed(move |_| {
+            if let Some(source) = pending.borrow_mut().take() {
+                source.remove();
+            }
+            let update_suggestions = update_suggestions.clone();
+            let pending_done = Rc::clone(&pending);
+            let source = glib::timeout_add_local_once(Duration::from_millis(200), move || {
+                *pending_done.borrow_mut() = None;
+                update_suggestions();
+            });
+            *pending.borrow_mut() = Some(source);
+        });
+    }
+
     // Search: SearchEntry debounces search-changed (~150ms) on its own.
     // A non-empty query populates the results page and swaps it in; the
     // composer hides while searching since the stream isn't visible.
@@ -336,12 +489,17 @@ fn build_ui(app: &Application) {
         let editing_id = Rc::clone(&editing_id);
         let entry_weak = search_entry.downgrade();
         let reveal_thought = reveal_thought.clone();
+        let suggestion_strip = suggestion_strip.clone();
+        let update_suggestions = update_suggestions.clone();
         search_entry.connect_search_changed(move |entry| {
             let query = entry.text();
             if query.trim().is_empty() {
                 stack.set_visible_child_name("stream");
                 composer.set_visible(true);
                 editing_banner.set_visible(editing_id.borrow().is_some());
+                // Restore the strip for whatever draft is sitting in the
+                // composer.
+                update_suggestions();
                 return;
             }
 
@@ -372,6 +530,7 @@ fn build_ui(app: &Application) {
             }
             composer.set_visible(false);
             editing_banner.set_visible(false);
+            suggestion_strip.set_visible(false);
             stack.set_visible_child_name("results");
         });
     }
@@ -527,7 +686,7 @@ fn model_dir() -> PathBuf {
     data_dir().join("models").join("all-MiniLM-L6-v2")
 }
 
-fn make_row(thought: &Thought) -> ListBoxRow {
+fn make_row(thought: &Thought) -> (ListBoxRow, Button) {
     let text = Label::builder()
         .label(&thought.text)
         .wrap(true)
@@ -542,12 +701,25 @@ fn make_row(thought: &Thought) -> ListBoxRow {
     } else {
         format!("• {relative}")
     };
-    let timestamp = Label::builder().label(timestamp_text).xalign(0.0).build();
+    let timestamp = Label::builder()
+        .label(timestamp_text)
+        .xalign(0.0)
+        .hexpand(true)
+        .build();
     timestamp.add_css_class("caption");
     timestamp.add_css_class("dim-label");
     if !thought.is_settled {
         timestamp.add_css_class("accent");
     }
+
+    // Related-thoughts affordance; the caller wires its click handler.
+    let related_button = Button::from_icon_name("insert-link-symbolic");
+    related_button.add_css_class("flat");
+    related_button.set_tooltip_text(Some("Related thoughts"));
+
+    let meta_box = GtkBox::new(Orientation::Horizontal, 6);
+    meta_box.append(&timestamp);
+    meta_box.append(&related_button);
 
     let row_box = GtkBox::builder()
         .orientation(Orientation::Vertical)
@@ -558,7 +730,7 @@ fn make_row(thought: &Thought) -> ListBoxRow {
         .margin_bottom(6)
         .build();
     row_box.append(&text);
-    row_box.append(&timestamp);
+    row_box.append(&meta_box);
 
     let row = ListBoxRow::new();
     row.set_child(Some(&row_box));
@@ -568,7 +740,69 @@ fn make_row(thought: &Thought) -> ListBoxRow {
     row.set_activatable(false);
     // Name the row after the thought so search can find and scroll to it.
     row.set_widget_name(&thought.id.to_string());
-    row
+    (row, related_button)
+}
+
+/// Build and pop up a popover under `parent` listing thoughts related to
+/// `id` (ranked by its stored vector); clicking one jumps the stream to
+/// it. Built per click and unparented after closing — popovers must be
+/// explicitly detached or GTK warns when the row goes away.
+fn show_related_popover(parent: &Button, store: &Rc<ThoughtStore>, id: Uuid, reveal: &RevealCell) {
+    let related = match store.find_related_to(id, RELATED_COUNT) {
+        Ok(related) => related,
+        Err(err) => {
+            eprintln!("buoy: related lookup failed: {err}");
+            return;
+        }
+    };
+
+    let popover = Popover::new();
+    let content = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(4)
+        .margin_start(6)
+        .margin_end(6)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+
+    if related.is_empty() {
+        let empty = Label::new(Some("No related thoughts"));
+        empty.add_css_class("dim-label");
+        content.append(&empty);
+    } else {
+        for found in related {
+            let item = Button::builder()
+                .child(
+                    &Label::builder()
+                        .label(&found.thought.text)
+                        .ellipsize(pango::EllipsizeMode::End)
+                        .max_width_chars(48)
+                        .xalign(0.0)
+                        .build(),
+                )
+                .build();
+            item.add_css_class("flat");
+            let reveal = Rc::clone(reveal);
+            let target = found.thought.id;
+            let popover_for_item = popover.clone();
+            item.connect_clicked(move |_| {
+                popover_for_item.popdown();
+                if let Some(reveal) = reveal.borrow().as_ref() {
+                    reveal(target);
+                }
+            });
+            content.append(&item);
+        }
+    }
+
+    popover.set_child(Some(&content));
+    popover.set_parent(parent);
+    popover.connect_closed(|popover| {
+        let popover = popover.clone();
+        glib::idle_add_local_once(move || popover.unparent());
+    });
+    popover.popup();
 }
 
 /// Build a search-result row: the match snippet with matched terms bolded
