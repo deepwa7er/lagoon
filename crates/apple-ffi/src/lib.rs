@@ -254,6 +254,38 @@ impl ThoughtStore {
             .collect())
     }
 
+    /// Related thoughts for an in-progress draft (the suggestion strip).
+    /// `exclude_id` drops the thought currently being edited. Returns
+    /// empty with a blank draft or no attached embedder — suggestions are
+    /// an enhancement, never an error the composer must handle. Callers
+    /// debounce ~200ms after the last keystroke.
+    pub fn find_related(
+        &self,
+        draft_text: &str,
+        top_k: u32,
+        exclude_id: Option<String>,
+    ) -> Result<Vec<ThoughtMatch>, FfiError> {
+        let exclude = exclude_id.map(|id| parse_id(&id)).transpose()?;
+        let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
+        Ok(guard
+            .find_related(draft_text, top_k as usize, exclude)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Related thoughts for an existing thought, ranked by its stored
+    /// vector. Empty when the thought has no vector yet.
+    pub fn find_related_to(&self, id: &str, top_k: u32) -> Result<Vec<ThoughtMatch>, FfiError> {
+        let uuid = parse_id(id)?;
+        let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
+        Ok(guard
+            .find_related_to(uuid, top_k as usize)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
     /// Load the embedding model from `model_dir` and attach it to the
     /// store. Loading takes a few hundred milliseconds — call from a
     /// background task, then drain `embed_missing`.

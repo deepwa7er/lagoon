@@ -18,6 +18,10 @@ final class ThoughtListModel {
     var editingId: String?
     /// Results for the search query currently in the search field.
     var searchResults: [ThoughtMatch] = []
+    /// Related past thoughts for the draft currently in the composer.
+    var suggestions: [ThoughtMatch] = []
+    /// Related thoughts expanded under stream rows, keyed by thought id.
+    var relatedExpanded: [String: [ThoughtMatch]] = [:]
 
     private var store: ThoughtStore?
     /// Cursor for the page after the oldest loaded thought; nil when the
@@ -25,6 +29,10 @@ final class ThoughtListModel {
     private var nextCursor: Cursor?
     private var isLoadingOlder = false
     private var searchTask: Task<Void, Never>?
+    private var suggestionTask: Task<Void, Never>?
+    /// The exact draft for which the user dismissed the suggestion strip;
+    /// it stays hidden until the draft text changes again.
+    private var dismissedSuggestionsDraft: String?
 
     /// How close to the oldest loaded thought a row must be (in rows) to
     /// trigger fetching the next page.
@@ -133,6 +141,49 @@ final class ThoughtListModel {
         }
     }
 
+    /// Debounced related-thought lookup for the composer draft: runs
+    /// ~200ms after the last keystroke, cancelling earlier pending calls.
+    func suggestDebounced(draft: String) {
+        suggestionTask?.cancel()
+        if draft != dismissedSuggestionsDraft {
+            dismissedSuggestionsDraft = nil
+        }
+        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, dismissedSuggestionsDraft == nil else {
+            suggestions = []
+            return
+        }
+        suggestionTask = Task {
+            try? await Task.sleep(for: .milliseconds(200))
+            guard !Task.isCancelled, let store else { return }
+            // Suggestions must never surface an error into the composer
+            // flow; on any failure the strip simply doesn't appear.
+            suggestions =
+                (try? store.findRelated(draftText: draft, topK: 3, excludeId: editingId)) ?? []
+        }
+    }
+
+    /// Hide the strip for the current draft; it returns once the draft
+    /// text changes.
+    func dismissSuggestions() {
+        dismissedSuggestionsDraft = draft
+        suggestions = []
+    }
+
+    /// Expand or collapse the related-thoughts list under a stream row.
+    func toggleRelated(for thought: Thought) async {
+        if relatedExpanded[thought.id] != nil {
+            relatedExpanded.removeValue(forKey: thought.id)
+            return
+        }
+        guard let store else { return }
+        do {
+            relatedExpanded[thought.id] = try store.findRelatedTo(id: thought.id, topK: 3)
+        } catch {
+            errorMessage = "Failed to load related thoughts: \(error.localizedDescription)"
+        }
+    }
+
     /// Fetch the page after the oldest loaded thought. Returns true when
     /// the loaded window actually grew.
     @discardableResult
@@ -224,6 +275,14 @@ struct ContentView: View {
                     stream
                     Divider()
 
+                    if !model.suggestions.isEmpty {
+                        SuggestionStrip(
+                            suggestions: model.suggestions,
+                            onSelect: { match in revealInStream(match.thought.id) },
+                            onDismiss: { model.dismissSuggestions() }
+                        )
+                    }
+
                     if model.isEditing {
                         EditingBanner(onCancel: { model.cancelEditing() })
                     }
@@ -232,11 +291,7 @@ struct ContentView: View {
                 } else {
                     SearchResultsList(results: model.searchResults) { match in
                         searchText = ""
-                        Task {
-                            if await model.reveal(id: match.thought.id) {
-                                scrollTarget = match.thought.id
-                            }
-                        }
+                        revealInStream(match.thought.id)
                     }
                 }
             }
@@ -247,6 +302,9 @@ struct ContentView: View {
             .searchable(text: $searchText, prompt: "Search thoughts")
             .onChange(of: searchText) { _, query in
                 model.searchDebounced(query)
+            }
+            .onChange(of: model.draft) { _, draft in
+                model.suggestDebounced(draft: draft)
             }
         }
         .task {
@@ -284,21 +342,44 @@ struct ContentView: View {
         )
     }
 
+    /// Page the stream until `id` is loaded, then scroll it to center.
+    private func revealInStream(_ id: String) {
+        Task {
+            if await model.reveal(id: id) {
+                scrollTarget = id
+            }
+        }
+    }
+
     private var stream: some View {
         ScrollViewReader { proxy in
             List {
                 ForEach(Array(model.thoughts.reversed()), id: \.id) { thought in
-                    ThoughtRow(thought: thought)
+                    VStack(alignment: .leading, spacing: 0) {
+                        ThoughtRow(
+                            thought: thought,
+                            relatedExpanded: model.relatedExpanded[thought.id] != nil,
+                            onToggleRelated: {
+                                Task { await model.toggleRelated(for: thought) }
+                            }
+                        )
                         .contentShape(Rectangle())
                         .onTapGesture {
                             model.startEditing(thought)
                             composerFocused = true
                         }
-                        .onAppear {
-                            // Oldest loaded thoughts render at the top; when
-                            // one scrolls into view, pull in the next page.
-                            Task { await model.loadOlderIfNeeded(visibleId: thought.id) }
+
+                        if let related = model.relatedExpanded[thought.id] {
+                            RelatedList(related: related) { match in
+                                revealInStream(match.thought.id)
+                            }
                         }
+                    }
+                    .onAppear {
+                        // Oldest loaded thoughts render at the top; when
+                        // one scrolls into view, pull in the next page.
+                        Task { await model.loadOlderIfNeeded(visibleId: thought.id) }
+                    }
                 }
             }
             .listStyle(.plain)
@@ -479,6 +560,8 @@ private struct SearchResultRow: View {
 
 private struct ThoughtRow: View {
     let thought: Thought
+    let relatedExpanded: Bool
+    let onToggleRelated: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -496,9 +579,105 @@ private struct ThoughtRow: View {
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+                Spacer()
+
+                Button(action: onToggleRelated) {
+                    Image(systemName: relatedExpanded ? "link.circle.fill" : "link.circle")
+                        .imageScale(.small)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Related thoughts")
             }
         }
         .padding(.vertical, 4)
+    }
+}
+
+/// Thin, passive strip above the composer showing related past thoughts
+/// while the user types. It never takes focus and never blocks input —
+/// it appears under the stream and gets out of the way when dismissed or
+/// when the draft stops matching anything.
+private struct SuggestionStrip: View {
+    let suggestions: [ThoughtMatch]
+    let onSelect: (ThoughtMatch) -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Image(systemName: "link")
+                .imageScale(.small)
+                .foregroundStyle(.secondary)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(suggestions, id: \.thought.id) { match in
+                        Button {
+                            onSelect(match)
+                        } label: {
+                            Text(match.thought.text)
+                                .lineLimit(1)
+                                .font(.caption)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(
+                                    Color.accentColor.opacity(0.08),
+                                    in: RoundedRectangle(cornerRadius: 6)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .frame(maxWidth: 240)
+                    }
+                }
+            }
+
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .imageScale(.small)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Hide suggestions")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+}
+
+/// Related thoughts expanded under a stream row; tapping one jumps the
+/// stream to it.
+private struct RelatedList: View {
+    let related: [ThoughtMatch]
+    let onSelect: (ThoughtMatch) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if related.isEmpty {
+                Text("No related thoughts")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            } else {
+                ForEach(related, id: \.thought.id) { match in
+                    Button {
+                        onSelect(match)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.turn.down.right")
+                                .imageScale(.small)
+                                .foregroundStyle(.tertiary)
+                            Text(match.thought.text)
+                                .lineLimit(1)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(.leading, 16)
+        .padding(.bottom, 6)
     }
 }
 
