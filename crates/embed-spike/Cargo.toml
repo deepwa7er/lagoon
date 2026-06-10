@@ -1,0 +1,29 @@
+# Phase 3 pre-phase spike: can candle run all-MiniLM-L6-v2 fast enough on
+# iPhone-class hardware? Throwaway crate on a throwaway branch — measures
+# load time, per-sentence embedding latency, and sanity-checks cosine
+# similarity on a tiny corpus. See docs/plan-buildout.md, Phase 3.
+[package]
+name = "buoy-embed-spike"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "embed-spike"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+candle-core = "0.10"
+candle-nn = "0.10"
+candle-transformers = "0.10"
+serde_json = "1"
+# fancy-regex backend keeps the tokenizer pure Rust — the default onig
+# backend is a C library whose objects fail to link against rustc's iOS
+# deployment target (undefined ___chkstk_darwin).
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+candle-core = { version = "0.10", features = ["accelerate"] }
