@@ -9,9 +9,10 @@
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use buoy_core::{Cursor, DEFAULT_PAGE_SIZE, Thought, ThoughtMatch, ThoughtStore};
+use buoy_core::{Cursor, DEFAULT_PAGE_SIZE, MiniLmEmbedder, Thought, ThoughtMatch, ThoughtStore};
 use gtk::glib::{self, Propagation};
 use gtk::prelude::*;
 use gtk::{
@@ -347,7 +348,7 @@ fn build_ui(app: &Application) {
             while let Some(child) = results_list.first_child() {
                 results_list.remove(&child);
             }
-            match store.search_text(&query, MAX_SEARCH_RESULTS) {
+            match store.search_combined(&query, MAX_SEARCH_RESULTS) {
                 Ok(matches) => {
                     for found in matches {
                         let row = make_result_row(&found);
@@ -462,6 +463,68 @@ fn build_ui(app: &Application) {
 
     window.present();
     text_view.grab_focus();
+
+    attach_embedder_when_ready(&store);
+}
+
+/// Load the embedding model on a worker thread (it takes a few hundred
+/// milliseconds) and attach it to the store from the main loop once ready,
+/// then backfill missing vectors in small idle-time batches. Semantic
+/// search is an enhancement: a missing or broken model leaves keyword
+/// search working and the app fully usable.
+fn attach_embedder_when_ready(store: &Rc<ThoughtStore>) {
+    let dir = model_dir();
+    if !dir.join("model.safetensors").exists() {
+        eprintln!(
+            "buoy: no embedding model at {} — search is keyword-only \
+             (run `just install-model-linux`)",
+            dir.display()
+        );
+        return;
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(MiniLmEmbedder::load(&dir));
+    });
+
+    // The store is not Send, so the loaded embedder is handed back to the
+    // main loop through a channel polled at a coarse interval until the
+    // one-shot load completes.
+    let store = Rc::clone(store);
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        match receiver.try_recv() {
+            Ok(Ok(embedder)) => {
+                store.set_embedder(Box::new(embedder));
+                start_embedding_backfill(&store);
+                glib::ControlFlow::Break
+            }
+            Ok(Err(err)) => {
+                eprintln!("buoy: semantic search unavailable: {err}");
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        }
+    });
+}
+
+/// Embed thoughts that have no vector yet, a few per idle slice so the
+/// main loop stays responsive (each embedding costs ~10–40ms).
+fn start_embedding_backfill(store: &Rc<ThoughtStore>) {
+    let store = Rc::clone(store);
+    glib::idle_add_local(move || match store.embed_missing(4) {
+        Ok(0) => glib::ControlFlow::Break,
+        Ok(_) => glib::ControlFlow::Continue,
+        Err(err) => {
+            eprintln!("buoy: embedding backfill failed: {err}");
+            glib::ControlFlow::Break
+        }
+    });
+}
+
+fn model_dir() -> PathBuf {
+    data_dir().join("models").join("all-MiniLM-L6-v2")
 }
 
 fn make_row(thought: &Thought) -> ListBoxRow {

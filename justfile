@@ -37,6 +37,16 @@ fetch-model:
     done
     ls -la "$dir"
 
+# Install the embedding model where the Linux app looks for it
+# ($XDG_DATA_HOME/buoy/models, defaulting to ~/.local/share/buoy/models).
+install-model-linux: fetch-model
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dest="${XDG_DATA_HOME:-$HOME/.local/share}/buoy/models"
+    mkdir -p "$dest"
+    cp -R models/all-MiniLM-L6-v2 "$dest/"
+    echo "==> installed to $dest/all-MiniLM-L6-v2"
+
 # Run all core tests on the host
 test:
     cargo test --workspace
