@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use buoy_core::{
-    Cursor as CoreCursor, Error as CoreError, Page as CorePage, Thought as CoreThought,
-    ThoughtStore as CoreStore,
+    Cursor as CoreCursor, Error as CoreError, MatchRange as CoreMatchRange, Page as CorePage,
+    Thought as CoreThought, ThoughtMatch as CoreThoughtMatch, ThoughtStore as CoreStore,
 };
 use uuid::Uuid;
 
@@ -86,6 +86,42 @@ impl From<CorePage> for Page {
         Self {
             thoughts: value.thoughts.into_iter().map(Into::into).collect(),
             next_cursor: value.next_cursor.map(Into::into),
+        }
+    }
+}
+
+/// A half-open byte range (UTF-8 offsets) into a [`ThoughtMatch`] snippet
+/// covering one matched term.
+#[derive(uniffi::Record)]
+pub struct MatchRange {
+    pub start: u64,
+    pub len: u64,
+}
+
+impl From<CoreMatchRange> for MatchRange {
+    fn from(value: CoreMatchRange) -> Self {
+        Self {
+            start: u64::try_from(value.start).expect("offset fits in u64"),
+            len: u64::try_from(value.len).expect("length fits in u64"),
+        }
+    }
+}
+
+/// One ranked full-text search result: the thought, a contextual snippet
+/// of its text, and highlight ranges into that snippet.
+#[derive(uniffi::Record)]
+pub struct ThoughtMatch {
+    pub thought: Thought,
+    pub snippet: String,
+    pub ranges: Vec<MatchRange>,
+}
+
+impl From<CoreThoughtMatch> for ThoughtMatch {
+    fn from(value: CoreThoughtMatch) -> Self {
+        Self {
+            thought: value.thought.into(),
+            snippet: value.snippet,
+            ranges: value.ranges.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -195,5 +231,17 @@ impl ThoughtStore {
             .transpose()?;
         let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
         Ok(guard.list_paginated(before, limit as usize)?.into())
+    }
+
+    /// Full-text search over thought text, best matches first. `query` is
+    /// raw user input; the final word matches as a prefix so results stay
+    /// useful while the user is still typing.
+    pub fn search_text(&self, query: &str, limit: u32) -> Result<Vec<ThoughtMatch>, FfiError> {
+        let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
+        Ok(guard
+            .search_text(query, limit as usize)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 }
