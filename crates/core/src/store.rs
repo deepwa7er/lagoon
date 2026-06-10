@@ -436,6 +436,78 @@ impl ThoughtStore {
             return Err(Error::NoEmbedder);
         };
         let query_vector = embedder.embed(query)?;
+        self.rank_by_vector(&query_vector, top_k, None)
+    }
+
+    /// Related thoughts for a draft the user is currently typing — the
+    /// suggestion strip's query. Reuses semantic ranking; `exclude` drops
+    /// the thought being edited so it doesn't suggest itself. Returns
+    /// empty (rather than erroring) with no embedder or a blank draft:
+    /// suggestions are an enhancement, never a failure the composer has
+    /// to handle.
+    ///
+    /// Callers should debounce: invoke ~200ms after the last keystroke,
+    /// cancelling the pending call on each new one.
+    pub fn find_related(
+        &self,
+        draft_text: &str,
+        top_k: usize,
+        exclude: Option<Uuid>,
+    ) -> Result<Vec<ThoughtMatch>> {
+        if draft_text.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let embedder_ref = self.embedder.borrow();
+        let Some(embedder) = embedder_ref.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let query_vector = embedder.embed(draft_text)?;
+        self.rank_by_vector(&query_vector, top_k, exclude)
+    }
+
+    /// Related thoughts for an existing thought, ranked by its *stored*
+    /// vector (no embedding computed, so this works without an embedder).
+    /// Returns empty when the thought has no vector yet; `NotFound` when
+    /// the thought doesn't exist.
+    pub fn find_related_to(&self, id: Uuid, top_k: usize) -> Result<Vec<ThoughtMatch>> {
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM thoughts WHERE id = ?1",
+                params![id.as_bytes().as_slice()],
+                |row| row.get::<_, i32>(0),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Err(Error::NotFound { id });
+        }
+
+        let blob: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT vector FROM embeddings WHERE thought_id = ?1",
+                params![id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(blob) = blob else {
+            return Ok(Vec::new());
+        };
+        let query_vector = blob_to_vector(&blob)?;
+        self.rank_by_vector(&query_vector, top_k, Some(id))
+    }
+
+    /// Rank stored vectors against `query_vector` by cosine similarity,
+    /// best first, dropping results under `MIN_SEMANTIC_SIMILARITY` and
+    /// the `exclude`d thought (a thought is always most similar to
+    /// itself).
+    fn rank_by_vector(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        exclude: Option<Uuid>,
+    ) -> Result<Vec<ThoughtMatch>> {
         let now = now_unix_millis();
 
         let mut stmt = self.conn.prepare(
@@ -447,6 +519,9 @@ impl ThoughtStore {
         let mut scored = Vec::new();
         while let Some(row) = rows.next()? {
             let raw = parse_thought_row(row)?;
+            if Some(raw.0) == exclude {
+                continue;
+            }
             let blob: Vec<u8> = row.get(5)?;
             let vector = blob_to_vector(&blob)?;
             if vector.len() != query_vector.len() {
@@ -459,7 +534,7 @@ impl ThoughtStore {
                     ),
                 });
             }
-            let similarity = dot(&query_vector, &vector);
+            let similarity = dot(query_vector, &vector);
             if similarity >= MIN_SEMANTIC_SIMILARITY {
                 scored.push((similarity, raw));
             }
@@ -1303,6 +1378,71 @@ mod tests {
         let results = store.search_combined("milk", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert!(!results[0].ranges.is_empty());
+    }
+
+    #[test]
+    fn find_related_ranks_and_excludes_the_edited_thought() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        store.set_embedder(Box::new(VocabEmbedder));
+        let dairy = store.create("cheese for the party").unwrap();
+        store.create("compiler error archaeology").unwrap();
+
+        // Drafting a related thought surfaces the dairy one.
+        let related = store.find_related("milk run tomorrow", 3, None).unwrap();
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].thought.id, dairy.id);
+
+        // While *editing* the dairy thought, it must not suggest itself.
+        let related = store
+            .find_related("cheese for the party", 3, Some(dairy.id))
+            .unwrap();
+        assert!(related.is_empty());
+    }
+
+    #[test]
+    fn find_related_is_empty_without_embedder_or_blank_draft() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        store.create("anything").unwrap();
+        assert!(store.find_related("anything", 3, None).unwrap().is_empty());
+
+        store.set_embedder(Box::new(VocabEmbedder));
+        assert!(store.find_related("   ", 3, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn find_related_to_uses_the_stored_vector_and_excludes_self() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        store.set_embedder(Box::new(VocabEmbedder));
+        let milk = store.create("milk for coffee").unwrap();
+        let cheese = store.create("cheese board ideas").unwrap();
+        store.create("borrow checker woes").unwrap();
+
+        let related = store.find_related_to(milk.id, 3).unwrap();
+        assert_eq!(related.len(), 1, "only the dairy-concept thought relates");
+        assert_eq!(related[0].thought.id, cheese.id);
+
+        // Works without an embedder — ranking uses stored vectors only.
+        let fresh = ThoughtStore::open_in_memory().unwrap();
+        fresh.set_embedder(Box::new(VocabEmbedder));
+        let a = fresh.create("milk").unwrap();
+        fresh.create("cheese").unwrap();
+        let fresh_related = fresh.find_related_to(a.id, 3).unwrap();
+        assert_eq!(fresh_related.len(), 1);
+    }
+
+    #[test]
+    fn find_related_to_without_vector_is_empty_and_unknown_id_errors() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        // No embedder at creation time -> no stored vector.
+        let t = store.create("milk").unwrap();
+        assert!(store.find_related_to(t.id, 3).unwrap().is_empty());
+
+        assert!(matches!(
+            store
+                .find_related_to(Uuid::new_v4(), 3)
+                .expect_err("should fail"),
+            Error::NotFound { .. }
+        ));
     }
 
     #[test]
