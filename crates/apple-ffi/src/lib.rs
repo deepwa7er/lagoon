@@ -14,10 +14,21 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use buoy_core::{Error as CoreError, Thought as CoreThought, ThoughtStore as CoreStore};
+use buoy_core::{
+    Cursor as CoreCursor, Error as CoreError, Page as CorePage, Thought as CoreThought,
+    ThoughtStore as CoreStore,
+};
 use uuid::Uuid;
 
 uniffi::setup_scaffolding!();
+
+/// Page size the platform UIs use when they have no more specific need.
+/// Mirrors `buoy_core::DEFAULT_PAGE_SIZE` so Swift and Rust callers agree.
+#[uniffi::export]
+#[must_use]
+pub fn default_page_size() -> u32 {
+    u32::try_from(buoy_core::DEFAULT_PAGE_SIZE).expect("page size fits in u32")
+}
 
 /// Swift-facing thought record. `id` is the UUID as a lowercase hyphenated
 /// string; timestamps are milliseconds since the epoch (1970-01-01 UTC).
@@ -40,6 +51,41 @@ impl From<CoreThought> for Thought {
             created_at: value.created_at,
             updated_at: value.updated_at,
             is_settled: value.is_settled,
+        }
+    }
+}
+
+/// Keyset pagination cursor pointing just past one specific thought. Opaque
+/// to Swift: callers receive it from one page and hand it back unchanged to
+/// fetch the next.
+#[derive(uniffi::Record)]
+pub struct Cursor {
+    pub created_at: i64,
+    pub id: String,
+}
+
+impl From<CoreCursor> for Cursor {
+    fn from(value: CoreCursor) -> Self {
+        Self {
+            created_at: value.created_at,
+            id: value.id.to_string(),
+        }
+    }
+}
+
+/// One page of thoughts, newest first. `next_cursor` is present when more
+/// older thoughts exist after this page.
+#[derive(uniffi::Record)]
+pub struct Page {
+    pub thoughts: Vec<Thought>,
+    pub next_cursor: Option<Cursor>,
+}
+
+impl From<CorePage> for Page {
+    fn from(value: CorePage) -> Self {
+        Self {
+            thoughts: value.thoughts.into_iter().map(Into::into).collect(),
+            next_cursor: value.next_cursor.map(Into::into),
         }
     }
 }
@@ -134,5 +180,20 @@ impl ThoughtStore {
     pub fn list(&self) -> Result<Vec<Thought>, FfiError> {
         let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
         Ok(guard.list()?.into_iter().map(Into::into).collect())
+    }
+
+    /// Return one page of thoughts, newest first. `before` is the cursor
+    /// returned by the previous page, or nil to start at the newest.
+    pub fn list_paginated(&self, before: Option<Cursor>, limit: u32) -> Result<Page, FfiError> {
+        let before = before
+            .map(|cursor| {
+                Ok::<_, FfiError>(CoreCursor {
+                    created_at: cursor.created_at,
+                    id: parse_id(&cursor.id)?,
+                })
+            })
+            .transpose()?;
+        let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
+        Ok(guard.list_paginated(before, limit as usize)?.into())
     }
 }

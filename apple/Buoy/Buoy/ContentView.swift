@@ -8,6 +8,8 @@ import AppKit
 @MainActor
 @Observable
 final class ThoughtListModel {
+    /// Loaded window of the stream, newest first. Grows toward older
+    /// thoughts as the user scrolls back through history.
     var thoughts: [Thought] = []
     var draft: String = ""
     var errorMessage: String?
@@ -16,6 +18,14 @@ final class ThoughtListModel {
     var editingId: String?
 
     private var store: ThoughtStore?
+    /// Cursor for the page after the oldest loaded thought; nil when the
+    /// entire stream is loaded.
+    private var nextCursor: Cursor?
+    private var isLoadingOlder = false
+
+    /// How close to the oldest loaded thought a row must be (in rows) to
+    /// trigger fetching the next page.
+    private static let loadOlderMargin = 5
 
     var isEditing: Bool { editingId != nil }
 
@@ -29,12 +39,44 @@ final class ThoughtListModel {
         }
     }
 
+    /// Reload the stream from the newest thought, covering at least the
+    /// window that was already loaded so a refresh never silently shrinks
+    /// what the user can see (and never disturbs their scroll position by
+    /// dropping rows).
     func refresh() async {
         guard let store else { return }
         do {
-            thoughts = try store.list()
+            let pageSize = defaultPageSize()
+            let target = max(thoughts.count, Int(pageSize))
+            var loaded: [Thought] = []
+            var cursor: Cursor?
+            repeat {
+                let page = try store.listPaginated(before: cursor, limit: pageSize)
+                loaded.append(contentsOf: page.thoughts)
+                cursor = page.nextCursor
+            } while cursor != nil && loaded.count < target
+            thoughts = loaded
+            nextCursor = cursor
         } catch {
             errorMessage = "Failed to load thoughts: \(error.localizedDescription)"
+        }
+    }
+
+    /// Called as stream rows appear. When one of the oldest few loaded rows
+    /// becomes visible and more history exists, fetch the next page.
+    func loadOlderIfNeeded(visibleId: String) async {
+        guard let store, let cursor = nextCursor, !isLoadingOlder else { return }
+        guard thoughts.suffix(Self.loadOlderMargin).contains(where: { $0.id == visibleId }) else {
+            return
+        }
+        isLoadingOlder = true
+        defer { isLoadingOlder = false }
+        do {
+            let page = try store.listPaginated(before: cursor, limit: defaultPageSize())
+            thoughts.append(contentsOf: page.thoughts)
+            nextCursor = page.nextCursor
+        } catch {
+            errorMessage = "Failed to load older thoughts: \(error.localizedDescription)"
         }
     }
 
@@ -108,6 +150,11 @@ struct ContentView: View {
                         .onTapGesture {
                             model.startEditing(thought)
                             composerFocused = true
+                        }
+                        .onAppear {
+                            // Oldest loaded thoughts render at the top; when
+                            // one scrolls into view, pull in the next page.
+                            Task { await model.loadOlderIfNeeded(visibleId: thought.id) }
                         }
                 }
             }

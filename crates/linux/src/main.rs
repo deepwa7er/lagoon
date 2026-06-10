@@ -6,12 +6,12 @@
 //! and an edit-mode banner that appears when a stream row has been
 //! tapped to edit.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use buoy_core::{Thought, ThoughtStore};
+use buoy_core::{Cursor, DEFAULT_PAGE_SIZE, Thought, ThoughtStore};
 use gtk::glib::{self, Propagation};
 use gtk::prelude::*;
 use gtk::{
@@ -40,6 +40,15 @@ fn build_ui(app: &Application) {
     };
 
     let editing_id: Rc<RefCell<Option<Uuid>>> = Rc::new(RefCell::new(None));
+
+    // Pagination state for the stream. `next_cursor` points at the page
+    // after the oldest loaded thought (None = fully loaded); `loaded_count`
+    // is how many thoughts the list currently shows, so a refresh can cover
+    // the same window; `loading_older` guards against re-entrant loads
+    // while a prepend is still settling.
+    let next_cursor: Rc<RefCell<Option<Cursor>>> = Rc::new(RefCell::new(None));
+    let loaded_count: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+    let loading_older: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
     let list_box = ListBox::new();
     list_box.set_selection_mode(gtk::SelectionMode::None);
@@ -144,42 +153,116 @@ fn build_ui(app: &Application) {
         }
     };
 
-    // refresh_list: rebuild stream rows, wiring each row's activate signal
-    // to start_editing for its own thought.
+    // make_wired_row: build a stream row with its tap-to-edit gesture.
+    // ListBoxRow's `activate` signal is unreliable for plain mouse clicks
+    // in GTK4, so each row gets an explicit GestureClick that enters edit
+    // mode for its own thought.
+    let make_wired_row = {
+        let start_editing = start_editing.clone();
+        move |thought: &Thought| -> ListBoxRow {
+            let row = make_row(thought);
+            let click = GestureClick::new();
+            let start = start_editing.clone();
+            let id = thought.id;
+            let text = thought.text.clone();
+            click.connect_released(move |_, _, _, _| {
+                start(id, text.clone());
+            });
+            row.add_controller(click);
+            row
+        }
+    };
+
+    // refresh_list: reload the stream from the newest thought, covering at
+    // least the window that was already loaded so a refresh never silently
+    // shrinks what the user can see.
     let refresh_list = {
         let list_box = list_box.clone();
         let store = Rc::clone(&store);
-        let start_editing = start_editing.clone();
+        let make_wired_row = make_wired_row.clone();
+        let next_cursor = Rc::clone(&next_cursor);
+        let loaded_count = Rc::clone(&loaded_count);
         move || {
+            let target = loaded_count.get().max(DEFAULT_PAGE_SIZE);
+            let mut thoughts = Vec::new();
+            let mut cursor = None;
+            loop {
+                let page = match store.list_paginated(cursor, DEFAULT_PAGE_SIZE) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        eprintln!("buoy: list failed: {err}");
+                        return;
+                    }
+                };
+                thoughts.extend(page.thoughts);
+                cursor = page.next_cursor;
+                if cursor.is_none() || thoughts.len() >= target {
+                    break;
+                }
+            }
+            *next_cursor.borrow_mut() = cursor;
+            loaded_count.set(thoughts.len());
+
             while let Some(child) = list_box.first_child() {
                 list_box.remove(&child);
             }
-            let thoughts = match store.list() {
-                Ok(t) => t,
-                Err(err) => {
-                    eprintln!("buoy: list failed: {err}");
-                    return;
-                }
-            };
             for thought in thoughts.into_iter().rev() {
-                let row = make_row(&thought);
-
-                // ListBoxRow's `activate` signal is unreliable for plain
-                // mouse clicks in GTK4. Attach an explicit GestureClick so
-                // single-clicks on any part of the row enter edit mode.
-                let click = GestureClick::new();
-                let start = start_editing.clone();
-                let id = thought.id;
-                let text = thought.text.clone();
-                click.connect_released(move |_, _, _, _| {
-                    start(id, text.clone());
-                });
-                row.add_controller(click);
-
-                list_box.append(&row);
+                list_box.append(&make_wired_row(&thought));
             }
         }
     };
+
+    // load_older: fetch the page after the oldest loaded thought and
+    // prepend its rows, keeping the user's scroll position anchored.
+    let load_older = {
+        let list_box = list_box.clone();
+        let store = Rc::clone(&store);
+        let make_wired_row = make_wired_row.clone();
+        let next_cursor = Rc::clone(&next_cursor);
+        let loaded_count = Rc::clone(&loaded_count);
+        let loading_older = Rc::clone(&loading_older);
+        let stream_scroll = stream_scroll.clone();
+        move || {
+            if loading_older.get() {
+                return;
+            }
+            let Some(cursor) = *next_cursor.borrow() else {
+                return;
+            };
+            loading_older.set(true);
+            let page = match store.list_paginated(Some(cursor), DEFAULT_PAGE_SIZE) {
+                Ok(p) => p,
+                Err(err) => {
+                    eprintln!("buoy: loading older thoughts failed: {err}");
+                    loading_older.set(false);
+                    return;
+                }
+            };
+            *next_cursor.borrow_mut() = page.next_cursor;
+            loaded_count.set(loaded_count.get() + page.thoughts.len());
+
+            keep_scroll_anchored(&stream_scroll);
+            // The page is newest-first; prepending in that order walks the
+            // final top-of-list order out to oldest-first.
+            for thought in &page.thoughts {
+                list_box.prepend(&make_wired_row(thought));
+            }
+            loading_older.set(false);
+        }
+    };
+
+    // Pull in older pages as the user scrolls within a viewport's height
+    // of the top. load_older itself is a no-op once the stream is fully
+    // loaded or while a prepend is in flight.
+    {
+        let load_older = load_older.clone();
+        let adjust = stream_scroll.vadjustment();
+        adjust.connect_value_changed(move |adjust| {
+            if adjust.value() < adjust.page_size() {
+                load_older();
+            }
+        });
+    }
 
     // save: commit the draft as either a new thought or an update to the
     // one currently being edited, then refresh.
@@ -370,6 +453,30 @@ fn now_unix_millis() -> i64 {
         .ok()
         .and_then(|d| i64::try_from(d.as_millis()).ok())
         .unwrap_or(0)
+}
+
+/// Keep the viewport visually still across a row prepend. GTK preserves the
+/// adjustment *value* (distance from the top of the content), so growing the
+/// content above the viewport would visually jump the stream. Capture the
+/// current position and re-apply it relative to the new upper bound once the
+/// resize lands, then disconnect.
+fn keep_scroll_anchored(scrolled: &ScrolledWindow) {
+    let adjust = scrolled.vadjustment();
+    let old_upper = adjust.upper();
+    let old_value = adjust.value();
+    let handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::new(RefCell::new(None));
+    let handler_in_closure = Rc::clone(&handler);
+    let id = adjust.connect_changed(move |adjust| {
+        let delta = adjust.upper() - old_upper;
+        if delta <= 0.0 {
+            return;
+        }
+        adjust.set_value(old_value + delta);
+        if let Some(id) = handler_in_closure.borrow_mut().take() {
+            adjust.disconnect(id);
+        }
+    });
+    *handler.borrow_mut() = Some(id);
 }
 
 fn scroll_to_bottom(scrolled: &ScrolledWindow) {
