@@ -11,17 +11,20 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use buoy_core::{Cursor, DEFAULT_PAGE_SIZE, Thought, ThoughtStore};
+use buoy_core::{Cursor, DEFAULT_PAGE_SIZE, Thought, ThoughtMatch, ThoughtStore};
 use gtk::glib::{self, Propagation};
 use gtk::prelude::*;
 use gtk::{
     Application, ApplicationWindow, Box as GtkBox, Button, EventControllerKey, GestureClick, Image,
-    Label, ListBox, ListBoxRow, Orientation, PropagationPhase, ScrolledWindow, Separator, TextView,
-    WrapMode, gdk,
+    Label, ListBox, ListBoxRow, Orientation, PropagationPhase, ScrolledWindow, SearchEntry,
+    Separator, Stack, TextView, WrapMode, gdk, pango,
 };
 use uuid::Uuid;
 
 const APP_ID: &str = "io.joemafrici.Buoy";
+
+/// Upper bound on search results shown for one query.
+const MAX_SEARCH_RESULTS: usize = 50;
 
 fn main() -> glib::ExitCode {
     let app = Application::builder().application_id(APP_ID).build();
@@ -96,8 +99,40 @@ fn build_ui(app: &Application) {
     composer.append(&composer_scroll);
     composer.append(&save_button);
 
+    // Persistent search bar above the stream (this is the desktop app;
+    // pull-to-reveal is the mobile pattern). A non-empty query swaps the
+    // stream for a results page in the stack below.
+    let search_entry = SearchEntry::builder()
+        .placeholder_text("Search thoughts")
+        .hexpand(true)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(8)
+        .margin_bottom(8)
+        .build();
+
+    let results_list = ListBox::new();
+    results_list.set_selection_mode(gtk::SelectionMode::None);
+    let results_placeholder = Label::new(Some("No matching thoughts"));
+    results_placeholder.add_css_class("dim-label");
+    results_placeholder.set_margin_top(24);
+    results_placeholder.set_margin_bottom(24);
+    results_list.set_placeholder(Some(&results_placeholder));
+
+    let results_scroll = ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&results_list)
+        .build();
+
+    let stack = Stack::new();
+    stack.add_named(&stream_scroll, Some("stream"));
+    stack.add_named(&results_scroll, Some("results"));
+
     let main_box = GtkBox::new(Orientation::Vertical, 0);
-    main_box.append(&stream_scroll);
+    main_box.append(&search_entry);
+    main_box.append(&Separator::new(Orientation::Horizontal));
+    main_box.append(&stack);
     main_box.append(&Separator::new(Orientation::Horizontal));
     main_box.append(&editing_banner);
     main_box.append(&composer);
@@ -212,44 +247,136 @@ fn build_ui(app: &Application) {
         }
     };
 
-    // load_older: fetch the page after the oldest loaded thought and
-    // prepend its rows, keeping the user's scroll position anchored.
-    let load_older = {
+    // prepend_older_page: fetch the page after the oldest loaded thought
+    // and prepend its rows. `anchor_scroll` keeps the viewport visually
+    // still — wanted while the user is scrolling back, unwanted when the
+    // caller is about to jump to a specific row anyway. Returns true when
+    // the loaded window actually grew.
+    let prepend_older_page = {
         let list_box = list_box.clone();
         let store = Rc::clone(&store);
         let make_wired_row = make_wired_row.clone();
         let next_cursor = Rc::clone(&next_cursor);
         let loaded_count = Rc::clone(&loaded_count);
-        let loading_older = Rc::clone(&loading_older);
         let stream_scroll = stream_scroll.clone();
-        move || {
-            if loading_older.get() {
-                return;
-            }
+        move |anchor_scroll: bool| -> bool {
             let Some(cursor) = *next_cursor.borrow() else {
-                return;
+                return false;
             };
-            loading_older.set(true);
             let page = match store.list_paginated(Some(cursor), DEFAULT_PAGE_SIZE) {
                 Ok(p) => p,
                 Err(err) => {
                     eprintln!("buoy: loading older thoughts failed: {err}");
-                    loading_older.set(false);
-                    return;
+                    return false;
                 }
             };
             *next_cursor.borrow_mut() = page.next_cursor;
             loaded_count.set(loaded_count.get() + page.thoughts.len());
 
-            keep_scroll_anchored(&stream_scroll);
+            if page.thoughts.is_empty() {
+                return false;
+            }
+            if anchor_scroll {
+                keep_scroll_anchored(&stream_scroll);
+            }
             // The page is newest-first; prepending in that order walks the
             // final top-of-list order out to oldest-first.
             for thought in &page.thoughts {
                 list_box.prepend(&make_wired_row(thought));
             }
+            true
+        }
+    };
+
+    // load_older: scroll-triggered variant of prepend_older_page, guarded
+    // against re-entry while a prepend is still settling.
+    let load_older = {
+        let loading_older = Rc::clone(&loading_older);
+        let prepend_older_page = prepend_older_page.clone();
+        move || {
+            if loading_older.get() {
+                return;
+            }
+            loading_older.set(true);
+            prepend_older_page(true);
             loading_older.set(false);
         }
     };
+
+    // reveal_thought: make sure the thought's row is loaded, then scroll
+    // the stream to it. Used when the user picks a search result.
+    let reveal_thought = {
+        let list_box = list_box.clone();
+        let stream_scroll = stream_scroll.clone();
+        let prepend_older_page = prepend_older_page.clone();
+        move |id: Uuid| {
+            let name = id.to_string();
+            while row_by_name(&list_box, &name).is_none() {
+                if !prepend_older_page(false) {
+                    break;
+                }
+            }
+            match row_by_name(&list_box, &name) {
+                Some(row) => scroll_to_row(&stream_scroll, &list_box, &row),
+                None => eprintln!("buoy: thought {id} is not in the stream"),
+            }
+        }
+    };
+
+    // Search: SearchEntry debounces search-changed (~150ms) on its own.
+    // A non-empty query populates the results page and swaps it in; the
+    // composer hides while searching since the stream isn't visible.
+    {
+        let store = Rc::clone(&store);
+        let stack = stack.clone();
+        let results_list = results_list.clone();
+        let composer = composer.clone();
+        let editing_banner = editing_banner.clone();
+        let editing_id = Rc::clone(&editing_id);
+        let entry_weak = search_entry.downgrade();
+        let reveal_thought = reveal_thought.clone();
+        search_entry.connect_search_changed(move |entry| {
+            let query = entry.text();
+            if query.trim().is_empty() {
+                stack.set_visible_child_name("stream");
+                composer.set_visible(true);
+                editing_banner.set_visible(editing_id.borrow().is_some());
+                return;
+            }
+
+            while let Some(child) = results_list.first_child() {
+                results_list.remove(&child);
+            }
+            match store.search_text(&query, MAX_SEARCH_RESULTS) {
+                Ok(matches) => {
+                    for found in matches {
+                        let row = make_result_row(&found);
+                        let click = GestureClick::new();
+                        let id = found.thought.id;
+                        let entry_weak = entry_weak.clone();
+                        let reveal = reveal_thought.clone();
+                        click.connect_released(move |_, _, _, _| {
+                            // Clearing the entry flips the stack back to
+                            // the stream before we scroll to the thought.
+                            if let Some(entry) = entry_weak.upgrade() {
+                                entry.set_text("");
+                            }
+                            reveal(id);
+                        });
+                        row.add_controller(click);
+                        results_list.append(&row);
+                    }
+                }
+                Err(err) => eprintln!("buoy: search failed: {err}"),
+            }
+            composer.set_visible(false);
+            editing_banner.set_visible(false);
+            stack.set_visible_child_name("results");
+        });
+    }
+
+    // Escape inside the search field clears it, returning to the stream.
+    search_entry.connect_stop_search(|entry| entry.set_text(""));
 
     // Pull in older pages as the user scrolls within a viewport's height
     // of the top. load_older itself is a no-op once the stream is fully
@@ -376,7 +503,87 @@ fn make_row(thought: &Thought) -> ListBoxRow {
     // We don't want the row's own activation behavior; clicks are handled
     // by a per-row GestureClick controller installed at refresh time.
     row.set_activatable(false);
+    // Name the row after the thought so search can find and scroll to it.
+    row.set_widget_name(&thought.id.to_string());
     row
+}
+
+/// Build a search-result row: the match snippet with matched terms bolded
+/// via Pango attributes (whose indices are UTF-8 byte offsets, exactly what
+/// the core's match ranges are), over a relative timestamp.
+fn make_result_row(found: &ThoughtMatch) -> ListBoxRow {
+    let snippet = Label::builder()
+        .label(&found.snippet)
+        .wrap(true)
+        .xalign(0.0)
+        .build();
+
+    let attrs = pango::AttrList::new();
+    for range in &found.ranges {
+        let (Ok(start), Ok(end)) = (
+            u32::try_from(range.start),
+            u32::try_from(range.start + range.len),
+        ) else {
+            continue;
+        };
+        let mut bold = pango::AttrInt::new_weight(pango::Weight::Bold);
+        bold.set_start_index(start);
+        bold.set_end_index(end);
+        attrs.insert(bold);
+    }
+    snippet.set_attributes(Some(&attrs));
+
+    let relative = format_relative(found.thought.created_at, now_unix_millis());
+    let timestamp = Label::builder().label(relative).xalign(0.0).build();
+    timestamp.add_css_class("caption");
+    timestamp.add_css_class("dim-label");
+
+    let row_box = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(2)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+    row_box.append(&snippet);
+    row_box.append(&timestamp);
+
+    let row = ListBoxRow::new();
+    row.set_child(Some(&row_box));
+    row.set_selectable(false);
+    row.set_activatable(false);
+    row
+}
+
+/// Find the stream row whose widget name is `name` (thought ids are used
+/// as row names; see `make_row`).
+fn row_by_name(list_box: &ListBox, name: &str) -> Option<ListBoxRow> {
+    let mut child = list_box.first_child();
+    while let Some(widget) = child {
+        if widget.widget_name() == name {
+            return widget.downcast::<ListBoxRow>().ok();
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
+
+/// Scroll the stream so `row` sits centered in the viewport. Runs from an
+/// idle callback so freshly prepended rows have been laid out and their
+/// bounds are valid.
+fn scroll_to_row(scrolled: &ScrolledWindow, list_box: &ListBox, row: &ListBoxRow) {
+    let scrolled = scrolled.clone();
+    let list_box = list_box.clone();
+    let row = row.clone();
+    glib::idle_add_local(move || {
+        if let Some(bounds) = row.compute_bounds(&list_box) {
+            let adjust = scrolled.vadjustment();
+            let center = f64::from(bounds.y()) + f64::from(bounds.height()) / 2.0;
+            adjust.set_value(center - adjust.page_size() / 2.0);
+        }
+        glib::ControlFlow::Break
+    });
 }
 
 fn build_editing_banner() -> GtkBox {
