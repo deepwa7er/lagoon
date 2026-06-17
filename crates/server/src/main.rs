@@ -89,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/thoughts/{id}/history", get(api::history))
         .route("/api/search", get(api::search))
         .route("/api/related", post(api::related_to_draft))
+        .route("/api/sync", post(api::sync))
         .route("/healthz", get(api::healthz))
         .fallback_service(serve_dir)
         .with_state(shared);

@@ -17,10 +17,8 @@ The platform set and the server model changed, by decision:
   (`deploy.toml`/`deploy/provision.sh`), enrolled in `lighthouse.target`. No
   app-level auth — the tailnet is the security boundary, as with the other
   services. The browser is a thin client; the core is reused unchanged.
-- **iOS keeps its own local store** and does **not** yet share notes with the
-  web app. Unifying them — the **E2E-encrypted op-log sync** in Phase 5 below,
-  or pointing iOS at the server — remains future work and is the open question
-  to resolve next. Phase 5's design is retained below as the reference for that.
+- **iOS now syncs with the web store** (offline-capable, server-authoritative) —
+  see the realized design under Phase 5. The two no longer hold separate notes.
 
 The "all platforms move together / no hacks" quality bar is unchanged.
 
@@ -157,6 +155,26 @@ This is the **highest-risk phase**. Begin with a spike (1-3 days) to validate th
 
 **Goal:** A VPS-hosted sync server, plus a client sync engine in the Rust core.
 
+### Realized (2026-06-16) — server-authoritative, no E2E
+
+What shipped diverges from the original (E2E op-log) design below, because the
+web app made the server authoritative and able to read notes:
+
+- **Model:** server-authoritative, **per-record last-writer-wins** by
+  `updated_at` (not per-field lamport / CRDT). Deletes are **tombstones**
+  (`deleted_at`); local edits carry a **`dirty` outbox flag**. Schema v5 in
+  `crates/core/src/store.rs`; sync API (`changes_since` / `pending_changes` /
+  `apply_remote` / `mark_synced`) in `crates/core/src/sync.rs`.
+- **Wire:** JSON over plain HTTP on the tailnet (the tailnet encrypts transport).
+  **No E2E, no auth** — the server holds readable notes, like the web app.
+- **Endpoint:** one `POST /api/sync` (`crates/server`) — push the client's
+  changes (LWW), return the server's changes since the client's cursor.
+- **Clients:** the web app is a live view of the store (no sync needed). iOS/macOS
+  sync via `apple/Buoy/Buoy/Sync.swift` + the FFI sync methods (Phase 6).
+
+The E2E op-log design below is **retained as reference** only — revisit it if
+multi-user or untrusted-server requirements ever appear.
+
 ### Decisions to make at phase start
 
 | Question | Default choice | Reconsider if |
@@ -198,6 +216,16 @@ This is the **highest-risk phase**. Begin with a spike (1-3 days) to validate th
 ## Phase 6: Sync integration on each platform
 
 **Goal:** Sync runs in the background invisibly.
+
+### Realized (2026-06-16) — iOS/macOS
+
+Implemented in `apple/Buoy/Buoy/Sync.swift` + `ContentView.swift`: a `SyncService`
+that pushes the local outbox and applies the server's changes, triggered on app
+open, on `scenePhase` active/background, and after each capture; a toolbar sync
+status indicator. The store + network run off the main actor. App config: an
+outgoing-network entitlement (`Buoy.entitlements`) and a tailnet ATS exception
+(`Info.plist`). Still TODO from the list below: `BGTaskScheduler` periodic
+background sync, pull-to-refresh, an explicit offline banner.
 
 ### Platform UI work
 - **iOS** — `BGTaskScheduler` for periodic sync, sync-on-foreground, sync-on-send (push immediately)

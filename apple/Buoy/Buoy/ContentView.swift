@@ -23,7 +23,15 @@ final class ThoughtListModel {
     /// Related thoughts expanded under stream rows, keyed by thought id.
     var relatedExpanded: [String: [ThoughtMatch]] = [:]
 
+    /// Sync status, surfaced in the UI. `syncing` is true during a reconcile.
+    var syncing = false
+    var lastSynced: Date?
+    var syncError: String?
+
     private var store: ThoughtStore?
+    private var syncTask: Task<Void, Never>?
+    /// Opaque server change-feed cursor, persisted across launches.
+    private static let cursorKey = "buoy.sync.cursor"
     /// Cursor for the page after the oldest loaded thought; nil when the
     /// entire stream is loaded.
     private var nextCursor: Cursor?
@@ -46,8 +54,38 @@ final class ThoughtListModel {
             store = try ThoughtStore.open(path: path)
             await refresh()
             attachEmbedderInBackground()
+            syncNow()
         } catch {
             errorMessage = "Failed to open store: \(error.localizedDescription)"
+        }
+    }
+
+    /// Reconcile with the server: push local changes, pull remote ones. Runs the
+    /// store + network work off the main actor and refreshes the stream if any
+    /// remote changes landed. A failure (offline, server down) is recorded and
+    /// retried on the next trigger — captures never depend on it. Coalesces:
+    /// a sync already in flight isn't restarted.
+    func syncNow() {
+        guard let store, syncTask == nil else { return }
+        syncing = true
+        syncError = nil
+        let cursor = UserDefaults.standard.string(forKey: Self.cursorKey)
+        syncTask = Task { [weak self] in
+            let outcome = await Task.detached(priority: .utility) {
+                try await SyncService.reconcile(store: store, baseURL: buoyServerURL, since: cursor)
+            }.result
+            guard let self else { return }
+            switch outcome {
+            case let .success(result):
+                UserDefaults.standard.set(result.cursor, forKey: Self.cursorKey)
+                self.lastSynced = Date()
+                self.syncError = nil
+                if result.applied > 0 { await self.refresh() }
+            case let .failure(error):
+                self.syncError = String(describing: error)
+            }
+            self.syncing = false
+            self.syncTask = nil
         }
     }
 
@@ -236,6 +274,7 @@ final class ThoughtListModel {
             draft = ""
             editingId = nil
             await refresh()
+            syncNow()
         } catch {
             errorMessage = "Failed to save thought: \(error.localizedDescription)"
         }
@@ -306,6 +345,11 @@ struct ContentView: View {
             .onChange(of: model.draft) { _, draft in
                 model.suggestDebounced(draft: draft)
             }
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    SyncStatusButton(model: model)
+                }
+            }
         }
         .task {
             await model.open()
@@ -317,8 +361,10 @@ struct ContentView: View {
                 Task { await model.settleAllLive() }
             case .active:
                 // Refresh so any thoughts that crossed the settle window
-                // (or were force-settled on the way out) show up correctly.
+                // (or were force-settled on the way out) show up correctly,
+                // and reconcile with the server.
                 Task { await model.refresh() }
+                model.syncNow()
             @unknown default:
                 break
             }
@@ -475,6 +521,38 @@ private struct BareReturnSubmits: ViewModifier {
             return .handled
         }
         #endif
+    }
+}
+
+/// Toolbar sync indicator: a spinner while reconciling, an error glyph (tap to
+/// retry) when the last sync failed, or a synced glyph with the time otherwise.
+/// Tapping forces a sync.
+private struct SyncStatusButton: View {
+    let model: ThoughtListModel
+
+    var body: some View {
+        Button { model.syncNow() } label: {
+            if model.syncing {
+                ProgressView().controlSize(.small)
+            } else if model.syncError != nil {
+                Image(systemName: "exclamationmark.icloud")
+                    .foregroundStyle(.secondary)
+            } else {
+                Image(systemName: "checkmark.icloud")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .help(helpText)
+        .disabled(model.syncing)
+    }
+
+    private var helpText: String {
+        if model.syncing { return "Syncing…" }
+        if let error = model.syncError { return "Sync failed: \(error)" }
+        if let synced = model.lastSynced {
+            return "Last synced \(synced.formatted(date: .omitted, time: .shortened))"
+        }
+        return "Sync"
     }
 }
 

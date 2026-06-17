@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Outgoing network connections, for syncing with the buoy server over the
+	  tailnet. The App Sandbox / Hardened Runtime entitlements are still added by
+	  their build settings (ENABLE_APP_SANDBOX, ENABLE_HARDENED_RUNTIME); this
+	  file only adds the network-client capability they don't cover.
+	-->
+	<key>com.apple.security.network.client</key>
+	<true/>
+</dict>
+</plist>

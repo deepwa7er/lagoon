@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 
 use buoy_core::{
     Cursor as CoreCursor, Error as CoreError, MatchRange as CoreMatchRange, MiniLmEmbedder,
-    Page as CorePage, Thought as CoreThought, ThoughtMatch as CoreThoughtMatch,
+    Page as CorePage, SyncCursor as CoreSyncCursor, Thought as CoreThought,
+    ThoughtChange as CoreThoughtChange, ThoughtMatch as CoreThoughtMatch,
     ThoughtStore as CoreStore,
 };
 use uuid::Uuid;
@@ -125,6 +126,79 @@ impl From<CoreThoughtMatch> for ThoughtMatch {
             ranges: value.ranges.into_iter().map(Into::into).collect(),
         }
     }
+}
+
+/// Swift-facing keyset cursor into the sync change feed (ordered by
+/// `(updated_at, id)`). Opaque: clients persist it and hand it back on the next
+/// sync to pull only what's new.
+#[derive(uniffi::Record)]
+pub struct SyncCursor {
+    pub updated_at: i64,
+    pub id: String,
+}
+
+impl From<CoreSyncCursor> for SyncCursor {
+    fn from(value: CoreSyncCursor) -> Self {
+        Self {
+            updated_at: value.updated_at,
+            id: value.id.to_string(),
+        }
+    }
+}
+
+impl SyncCursor {
+    fn into_core(self) -> Result<CoreSyncCursor, FfiError> {
+        Ok(CoreSyncCursor {
+            updated_at: self.updated_at,
+            id: parse_id(&self.id)?,
+        })
+    }
+}
+
+/// Swift-facing thought record for sync, including tombstones (`deleted_at`
+/// present). Carries the raw persisted columns so a remote row applies exactly.
+#[derive(uniffi::Record)]
+pub struct ThoughtChange {
+    pub id: String,
+    pub text: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub settled_at: Option<i64>,
+    pub deleted_at: Option<i64>,
+}
+
+impl From<CoreThoughtChange> for ThoughtChange {
+    fn from(value: CoreThoughtChange) -> Self {
+        Self {
+            id: value.id.to_string(),
+            text: value.text,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            settled_at: value.settled_at,
+            deleted_at: value.deleted_at,
+        }
+    }
+}
+
+impl ThoughtChange {
+    fn into_core(self) -> Result<CoreThoughtChange, FfiError> {
+        Ok(CoreThoughtChange {
+            id: parse_id(&self.id)?,
+            text: self.text,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            settled_at: self.settled_at,
+            deleted_at: self.deleted_at,
+        })
+    }
+}
+
+/// Acknowledgement that a pushed change was accepted: clears the local dirty
+/// flag for `(id, updated_at)` unless the row was edited again since.
+#[derive(uniffi::Record)]
+pub struct SyncAck {
+    pub id: String,
+    pub updated_at: i64,
 }
 
 /// Errors surfaced to Swift. `UniFFI` maps each variant to a case on a Swift
@@ -303,5 +377,54 @@ impl ThoughtStore {
         let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
         let count = guard.embed_missing(limit as usize)?;
         Ok(u32::try_from(count).expect("count bounded by u32 limit"))
+    }
+
+    // ── sync ─────────────────────────────────────────────────────────────────
+
+    /// Locally-modified rows not yet pushed to the server (the outbox), up to
+    /// `limit`, oldest change first.
+    pub fn pending_changes(&self, limit: u32) -> Result<Vec<ThoughtChange>, FfiError> {
+        let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
+        Ok(guard
+            .pending_changes(limit as usize)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Changes since `since` (nil = full pull), oldest first, up to `limit`.
+    /// Used when applying a server response and to drain a large feed in pages.
+    pub fn changes_since(
+        &self,
+        since: Option<SyncCursor>,
+        limit: u32,
+    ) -> Result<Vec<ThoughtChange>, FfiError> {
+        let since = since.map(SyncCursor::into_core).transpose()?;
+        let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
+        Ok(guard
+            .changes_since(since, limit as usize)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Apply a change pulled from the server, last-writer-wins by `updated_at`.
+    /// Returns whether it was applied (false if local is newer/equal).
+    pub fn apply_remote(&self, change: ThoughtChange) -> Result<bool, FfiError> {
+        let change = change.into_core()?;
+        let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
+        Ok(guard.apply_remote(&change)?)
+    }
+
+    /// Clear the dirty flag for successfully-pushed rows (skipping any edited
+    /// again since they were read).
+    pub fn mark_synced(&self, pushed: Vec<SyncAck>) -> Result<(), FfiError> {
+        let pushed = pushed
+            .into_iter()
+            .map(|ack| Ok::<_, FfiError>((parse_id(&ack.id)?, ack.updated_at)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
+        guard.mark_synced(&pushed)?;
+        Ok(())
     }
 }

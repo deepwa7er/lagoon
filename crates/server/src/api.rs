@@ -15,7 +15,10 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use buoy_core::{Cursor, EditEntry, MatchRange, Page, Thought, ThoughtMatch, ThoughtStore};
+use buoy_core::{
+    Cursor, EditEntry, MatchRange, Page, SyncCursor, Thought, ThoughtChange, ThoughtMatch,
+    ThoughtStore,
+};
 
 /// Shared handle to the canonical store.
 pub type Shared = Arc<Mutex<ThoughtStore>>;
@@ -24,6 +27,9 @@ pub type Shared = Arc<Mutex<ThoughtStore>>;
 const DEFAULT_SEARCH_LIMIT: usize = 50;
 const DEFAULT_DRAFT_SUGGESTIONS: usize = 3;
 const DEFAULT_RELATED: usize = 5;
+/// Max changes returned in one `/api/sync` pull. A personal store fits in one
+/// round-trip; if a client ever gets exactly this many it simply syncs again.
+const SYNC_PAGE_LIMIT: usize = 1000;
 
 // ── DTOs ────────────────────────────────────────────────────────────────────
 
@@ -115,6 +121,44 @@ fn matches_dto(matches: &[ThoughtMatch]) -> Vec<ThoughtMatchDto> {
     matches.iter().map(ThoughtMatchDto::from).collect()
 }
 
+/// A full thought row for sync, including tombstones (`deleted_at` set).
+#[derive(Serialize, Deserialize)]
+pub struct ThoughtChangeDto {
+    pub id: String,
+    pub text: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub settled_at: Option<i64>,
+    pub deleted_at: Option<i64>,
+}
+
+impl From<&ThoughtChange> for ThoughtChangeDto {
+    fn from(c: &ThoughtChange) -> Self {
+        Self {
+            id: c.id.to_string(),
+            text: c.text.clone(),
+            created_at: c.created_at,
+            updated_at: c.updated_at,
+            settled_at: c.settled_at,
+            deleted_at: c.deleted_at,
+        }
+    }
+}
+
+impl TryFrom<&ThoughtChangeDto> for ThoughtChange {
+    type Error = AppError;
+    fn try_from(d: &ThoughtChangeDto) -> Result<Self, AppError> {
+        Ok(Self {
+            id: parse_id(&d.id)?,
+            text: d.text.clone(),
+            created_at: d.created_at,
+            updated_at: d.updated_at,
+            settled_at: d.settled_at,
+            deleted_at: d.deleted_at,
+        })
+    }
+}
+
 // ── cursor codec ─────────────────────────────────────────────────────────────
 
 /// Encode a keyset cursor as `"<created_at>_<uuid>"`. The uuid's hyphens never
@@ -139,6 +183,26 @@ fn decode_cursor(s: &str) -> Result<Cursor, AppError> {
 fn parse_id(raw: &str) -> Result<Uuid, AppError> {
     raw.parse::<Uuid>()
         .map_err(|_| AppError::bad_request("invalid thought id"))
+}
+
+/// Encode a sync cursor as `"<updated_at>_<uuid>"` (same shape as the list
+/// cursor, but over the `(updated_at, id)` change-feed order).
+fn encode_sync_cursor(c: SyncCursor) -> String {
+    format!("{}_{}", c.updated_at, c.id)
+}
+
+fn decode_sync_cursor(s: &str) -> Result<SyncCursor, AppError> {
+    let (updated, id) = s
+        .split_once('_')
+        .ok_or_else(|| AppError::bad_request("malformed sync cursor"))?;
+    Ok(SyncCursor {
+        updated_at: updated
+            .parse::<i64>()
+            .map_err(|_| AppError::bad_request("malformed sync cursor timestamp"))?,
+        id: id
+            .parse::<Uuid>()
+            .map_err(|_| AppError::bad_request("malformed sync cursor id"))?,
+    })
 }
 
 // ── handlers ─────────────────────────────────────────────────────────────────
@@ -257,6 +321,59 @@ pub async fn history(
     let id = parse_id(&id)?;
     let entries = blocking(store, move |s| s.edit_history(id)).await?;
     Ok(Json(entries.iter().map(EditEntryDto::from).collect()))
+}
+
+#[derive(Deserialize)]
+pub struct SyncRequest {
+    /// The client's high-water mark into the change feed (`None` = full pull).
+    pub since: Option<String>,
+    /// The client's locally-modified rows to push (its outbox).
+    #[serde(default)]
+    pub changes: Vec<ThoughtChangeDto>,
+}
+
+#[derive(Serialize)]
+pub struct SyncResponse {
+    /// Server changes since `since`, for the client to apply (last-writer-wins).
+    pub changes: Vec<ThoughtChangeDto>,
+    /// The cursor to send as `since` next time (echoes the request when the feed
+    /// is empty). When `changes` is `SYNC_PAGE_LIMIT` long, sync again to drain.
+    pub cursor: Option<String>,
+}
+
+/// `POST /api/sync` — the two-way reconcile. Applies the client's pushed changes
+/// (last-writer-wins by `updated_at`), then returns the server's changes since
+/// the client's cursor. The server is authoritative and keeps no outbox of its
+/// own — the web app already reflects this same store live.
+pub async fn sync(
+    State(store): State<Shared>,
+    Json(req): Json<SyncRequest>,
+) -> Result<Json<SyncResponse>, AppError> {
+    let since = req.since.as_deref().map(decode_sync_cursor).transpose()?;
+    // Validate + convert incoming changes outside the store lock.
+    let incoming = req
+        .changes
+        .iter()
+        .map(ThoughtChange::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let feed = blocking(store, move |s| {
+        for change in &incoming {
+            s.apply_remote(change)?;
+        }
+        s.changes_since(since, SYNC_PAGE_LIMIT)
+    })
+    .await?;
+
+    let cursor = feed
+        .last()
+        .map(SyncCursor::after)
+        .map(encode_sync_cursor)
+        .or(req.since);
+    Ok(Json(SyncResponse {
+        changes: feed.iter().map(ThoughtChangeDto::from).collect(),
+        cursor,
+    }))
 }
 
 /// `GET /healthz` — liveness probe.

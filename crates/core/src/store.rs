@@ -12,9 +12,10 @@ use crate::search::{
     MATCH_MARK_END, MATCH_MARK_START, SNIPPET_TOKENS, ThoughtMatch, build_match_query,
     extract_ranges,
 };
+use crate::sync::{SyncCursor, ThoughtChange};
 use crate::thought::{EditEntry, Thought};
 
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 
 /// Semantic results below this cosine similarity are dropped: they read as
 /// noise to the user. Initial heuristic calibrated against the Phase 3
@@ -120,9 +121,10 @@ impl ThoughtStore {
         // Computed before the transaction so the model doesn't run inside it.
         let vector = self.try_embed(text);
         let tx = self.conn.unchecked_transaction()?;
+        // dirty = 1 marks this as a local change to push on the next sync.
         tx.execute(
-            "INSERT INTO thoughts (id, text, created_at, updated_at, settled_at)
-             VALUES (?1, ?2, ?3, ?3, NULL)",
+            "INSERT INTO thoughts (id, text, created_at, updated_at, settled_at, dirty)
+             VALUES (?1, ?2, ?3, ?3, NULL, 1)",
             params![id.as_bytes().as_slice(), text, now],
         )?;
         if let Some(vector) = vector {
@@ -161,7 +163,7 @@ impl ThoughtStore {
         let current: Option<(String, i64, i64, Option<i64>)> = tx
             .query_row(
                 "SELECT text, created_at, updated_at, settled_at
-                 FROM thoughts WHERE id = ?1",
+                 FROM thoughts WHERE id = ?1 AND deleted_at IS NULL",
                 params![id.as_bytes().as_slice()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
@@ -180,7 +182,7 @@ impl ThoughtStore {
 
         tx.execute(
             "UPDATE thoughts
-             SET text = ?1, updated_at = ?2, settled_at = NULL
+             SET text = ?1, updated_at = ?2, settled_at = NULL, dirty = 1
              WHERE id = ?3",
             params![new_text, now, id.as_bytes().as_slice()],
         )?;
@@ -214,16 +216,28 @@ impl ThoughtStore {
         })
     }
 
-    /// Delete the thought with the given id. Any associated edit-history
-    /// rows are removed by the foreign-key cascade.
+    /// Delete the thought with the given id.
+    ///
+    /// This is a *soft* delete: the row is kept as a tombstone (`deleted_at`
+    /// set) so the deletion can propagate to other devices on sync. It is
+    /// excluded from every read and search path. The stored embedding is
+    /// dropped (a tombstone is never a semantic-search candidate); the
+    /// `edit_history` rows are retained. `dirty = 1` queues the tombstone to
+    /// push on the next sync.
     pub fn delete_thought(&self, id: Uuid) -> Result<()> {
+        let now = now_unix_millis();
         let affected = self.conn.execute(
-            "DELETE FROM thoughts WHERE id = ?1",
-            params![id.as_bytes().as_slice()],
+            "UPDATE thoughts SET deleted_at = ?1, updated_at = ?1, dirty = 1
+             WHERE id = ?2 AND deleted_at IS NULL",
+            params![now, id.as_bytes().as_slice()],
         )?;
         if affected == 0 {
             return Err(Error::NotFound { id });
         }
+        self.conn.execute(
+            "DELETE FROM embeddings WHERE thought_id = ?1",
+            params![id.as_bytes().as_slice()],
+        )?;
         Ok(())
     }
 
@@ -234,7 +248,8 @@ impl ThoughtStore {
     pub fn settle_all_live(&self) -> Result<usize> {
         let now = now_unix_millis();
         let n = self.conn.execute(
-            "UPDATE thoughts SET settled_at = ?1 WHERE settled_at IS NULL",
+            "UPDATE thoughts SET settled_at = ?1
+             WHERE settled_at IS NULL AND deleted_at IS NULL",
             params![now],
         )?;
         Ok(n)
@@ -248,6 +263,7 @@ impl ThoughtStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, text, created_at, updated_at, settled_at
              FROM thoughts
+             WHERE deleted_at IS NULL
              ORDER BY created_at DESC, id DESC",
         )?;
         let mut rows = stmt.query([])?;
@@ -267,6 +283,7 @@ impl ThoughtStore {
                 let mut stmt = self.conn.prepare(
                     "SELECT id, text, created_at, updated_at, settled_at
                      FROM thoughts
+                     WHERE deleted_at IS NULL
                      ORDER BY created_at DESC, id DESC
                      LIMIT ?1",
                 )?;
@@ -277,8 +294,8 @@ impl ThoughtStore {
                 let mut stmt = self.conn.prepare(
                     "SELECT id, text, created_at, updated_at, settled_at
                      FROM thoughts
-                     WHERE created_at < ?1
-                        OR (created_at = ?1 AND id < ?2)
+                     WHERE deleted_at IS NULL
+                       AND (created_at < ?1 OR (created_at = ?1 AND id < ?2))
                      ORDER BY created_at DESC, id DESC
                      LIMIT ?3",
                 )?;
@@ -320,7 +337,7 @@ impl ThoughtStore {
         let exists: bool = self
             .conn
             .query_row(
-                "SELECT 1 FROM thoughts WHERE id = ?1",
+                "SELECT 1 FROM thoughts WHERE id = ?1 AND deleted_at IS NULL",
                 params![id.as_bytes().as_slice()],
                 |row| row.get::<_, i32>(0),
             )
@@ -361,6 +378,7 @@ impl ThoughtStore {
              FROM thoughts_fts
              JOIN thoughts t ON t.rowid = thoughts_fts.rowid
              WHERE thoughts_fts MATCH ?1
+               AND t.deleted_at IS NULL
              ORDER BY rank
              LIMIT ?5",
         )?;
@@ -401,7 +419,7 @@ impl ThoughtStore {
             "SELECT t.id, t.text
              FROM thoughts t
              LEFT JOIN embeddings e ON e.thought_id = t.id
-             WHERE e.thought_id IS NULL
+             WHERE e.thought_id IS NULL AND t.deleted_at IS NULL
              ORDER BY t.created_at DESC
              LIMIT ?1",
         )?;
@@ -473,7 +491,7 @@ impl ThoughtStore {
         let exists: bool = self
             .conn
             .query_row(
-                "SELECT 1 FROM thoughts WHERE id = ?1",
+                "SELECT 1 FROM thoughts WHERE id = ?1 AND deleted_at IS NULL",
                 params![id.as_bytes().as_slice()],
                 |row| row.get::<_, i32>(0),
             )
@@ -513,7 +531,8 @@ impl ThoughtStore {
         let mut stmt = self.conn.prepare(
             "SELECT t.id, t.text, t.created_at, t.updated_at, t.settled_at, e.vector
              FROM embeddings e
-             JOIN thoughts t ON t.id = e.thought_id",
+             JOIN thoughts t ON t.id = e.thought_id
+             WHERE t.deleted_at IS NULL",
         )?;
         let mut rows = stmt.query([])?;
         let mut scored = Vec::new();
@@ -593,6 +612,151 @@ impl ThoughtStore {
         });
         fused.truncate(top_k);
         Ok(fused.into_iter().map(|(_, item)| item).collect())
+    }
+
+    // ── sync ────────────────────────────────────────────────────────────────
+
+    /// Local changes not yet pushed to the server — the client's outbox.
+    /// Returns up to `limit` `dirty` rows (including tombstones), oldest change
+    /// first, so a push proceeds in change order.
+    pub fn pending_changes(&self, limit: usize) -> Result<Vec<ThoughtChange>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, text, created_at, updated_at, settled_at, deleted_at
+             FROM thoughts
+             WHERE dirty = 1
+             ORDER BY updated_at ASC, id ASC
+             LIMIT ?1",
+        )?;
+        let mut rows = stmt.query(params![i64::try_from(limit).unwrap_or(i64::MAX)])?;
+        collect_change_rows(&mut rows)
+    }
+
+    /// The change feed: every thought (including tombstones) whose
+    /// `(updated_at, id)` is strictly after `since`, oldest first, up to
+    /// `limit`. This is what a client pulls from the server, and how the server
+    /// answers a pull. When exactly `limit` rows return, more may remain — the
+    /// caller resumes from [`SyncCursor::after`] the last one.
+    pub fn changes_since(
+        &self,
+        since: Option<SyncCursor>,
+        limit: usize,
+    ) -> Result<Vec<ThoughtChange>> {
+        let limit_i = i64::try_from(limit).unwrap_or(i64::MAX);
+        match since {
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, text, created_at, updated_at, settled_at, deleted_at
+                     FROM thoughts
+                     ORDER BY updated_at ASC, id ASC
+                     LIMIT ?1",
+                )?;
+                let mut rows = stmt.query(params![limit_i])?;
+                collect_change_rows(&mut rows)
+            }
+            Some(cursor) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, text, created_at, updated_at, settled_at, deleted_at
+                     FROM thoughts
+                     WHERE updated_at > ?1 OR (updated_at = ?1 AND id > ?2)
+                     ORDER BY updated_at ASC, id ASC
+                     LIMIT ?3",
+                )?;
+                let mut rows = stmt.query(params![
+                    cursor.updated_at,
+                    cursor.id.as_bytes().as_slice(),
+                    limit_i
+                ])?;
+                collect_change_rows(&mut rows)
+            }
+        }
+    }
+
+    /// Apply a change received from another device, last-writer-wins by
+    /// `updated_at`. Inserts the thought when absent; otherwise overwrites the
+    /// local row only when `change.updated_at` is strictly newer than the local
+    /// one (so re-applying an old or identical change is a no-op). The applied
+    /// row is marked clean (`dirty = 0`) — it came from the peer, not a local
+    /// edit. Embeddings are recomputed from the new text (dropped for a
+    /// tombstone); the FTS index follows via its triggers. Returns whether the
+    /// change was applied.
+    pub fn apply_remote(&self, change: &ThoughtChange) -> Result<bool> {
+        let id_blob = change.id.as_bytes().as_slice();
+        let local_updated: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT updated_at FROM thoughts WHERE id = ?1",
+                params![id_blob],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(local) = local_updated {
+            if local >= change.updated_at {
+                return Ok(false);
+            }
+        }
+
+        // Embed live changes so semantic search works; never embed a tombstone.
+        // Errors are swallowed like create/update — embed_missing retries later.
+        let vector = if change.deleted_at.is_none() {
+            self.try_embed(&change.text)
+        } else {
+            None
+        };
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO thoughts (id, text, created_at, updated_at, settled_at, deleted_at, dirty)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
+             ON CONFLICT(id) DO UPDATE SET
+                 text       = excluded.text,
+                 created_at = excluded.created_at,
+                 updated_at = excluded.updated_at,
+                 settled_at = excluded.settled_at,
+                 deleted_at = excluded.deleted_at,
+                 dirty      = 0",
+            params![
+                id_blob,
+                change.text,
+                change.created_at,
+                change.updated_at,
+                change.settled_at,
+                change.deleted_at,
+            ],
+        )?;
+        match vector {
+            Some(vector) => {
+                tx.execute(
+                    "INSERT OR REPLACE INTO embeddings (thought_id, vector) VALUES (?1, ?2)",
+                    params![id_blob, vector_to_blob(&vector)],
+                )?;
+            }
+            None => {
+                // Tombstone, or text changed with no embedder: drop any stale
+                // vector. embed_missing recomputes live ones later.
+                tx.execute(
+                    "DELETE FROM embeddings WHERE thought_id = ?1",
+                    params![id_blob],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Clear the `dirty` flag for rows that were successfully pushed, but only
+    /// when the row is unchanged since it was read (matched on `updated_at`).
+    /// A concurrent local edit between push and ack bumps `updated_at`, so that
+    /// row stays dirty and is pushed again on the next sync — no lost write.
+    pub fn mark_synced(&self, pushed: &[(Uuid, i64)]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (id, updated_at) in pushed {
+            tx.execute(
+                "UPDATE thoughts SET dirty = 0 WHERE id = ?1 AND updated_at = ?2",
+                params![id.as_bytes().as_slice(), updated_at],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn configure(&self) -> Result<()> {
@@ -689,6 +853,20 @@ impl ThoughtStore {
             )?;
         }
 
+        if current < 5 {
+            // Cross-device sync: `deleted_at` tombstones (so deletes can
+            // propagate) and a `dirty` outbox flag (rows modified locally and
+            // not yet pushed). The index supports the `(updated_at, id)` keyset
+            // the change feed scans on. Existing rows are marked dirty so a
+            // device with pre-sync data pushes it all up on its first sync.
+            self.conn.execute_batch(
+                "ALTER TABLE thoughts ADD COLUMN deleted_at INTEGER;
+                ALTER TABLE thoughts ADD COLUMN dirty INTEGER NOT NULL DEFAULT 0;
+                UPDATE thoughts SET dirty = 1;
+                CREATE INDEX thoughts_updated_at_idx ON thoughts (updated_at, id);",
+            )?;
+        }
+
         // Stamp the schema version. `user_version` is a PRAGMA, so we cannot
         // bind it as a parameter; building the statement with an integer
         // literal is safe.
@@ -716,6 +894,24 @@ fn parse_thought_row(row: &rusqlite::Row<'_>) -> Result<RawThoughtRow> {
     let updated_at: i64 = row.get(3)?;
     let settled_at: Option<i64> = row.get(4)?;
     Ok((id, text, created_at, updated_at, settled_at))
+}
+
+/// Collect `ThoughtChange` rows from a query selecting
+/// `(id, text, created_at, updated_at, settled_at, deleted_at)`.
+fn collect_change_rows(rows: &mut rusqlite::Rows<'_>) -> Result<Vec<ThoughtChange>> {
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let id_bytes: Vec<u8> = row.get(0)?;
+        out.push(ThoughtChange {
+            id: uuid_from_blob(&id_bytes)?,
+            text: row.get(1)?,
+            created_at: row.get(2)?,
+            updated_at: row.get(3)?,
+            settled_at: row.get(4)?,
+            deleted_at: row.get(5)?,
+        });
+    }
+    Ok(out)
 }
 
 fn into_thought(
@@ -927,23 +1123,37 @@ mod tests {
     }
 
     #[test]
-    fn delete_removes_thought_and_history() {
+    fn delete_is_a_tombstone_excluded_from_reads() {
         let store = ThoughtStore::open_in_memory().unwrap();
         let t = store.create("doomed").unwrap();
         store.settle_all_live().unwrap();
         store.update_thought(t.id, "still doomed").unwrap();
-        assert_eq!(store.edit_history(t.id).unwrap().len(), 1);
 
         store.delete_thought(t.id).unwrap();
+        // Excluded from every read/search path, and not addressable by id.
         assert!(store.list().unwrap().is_empty());
-        // FK cascade should have removed the history rows too. We can't
-        // call edit_history on the deleted id (it returns NotFound), so
-        // verify directly via SQL.
-        let history_count: i64 = store
+        assert!(store.list_paginated(None, 10).unwrap().thoughts.is_empty());
+        assert!(store.search_text("doomed", 10).unwrap().is_empty());
+        assert!(matches!(
+            store.edit_history(t.id),
+            Err(Error::NotFound { .. })
+        ));
+        assert!(matches!(
+            store.update_thought(t.id, "zombie"),
+            Err(Error::NotFound { .. })
+        ));
+        // Its stored embedding is gone (a tombstone is never a search candidate).
+        let embeddings: i64 = store
             .conn
-            .query_row("SELECT count(*) FROM edit_history", [], |row| row.get(0))
+            .query_row("SELECT count(*) FROM embeddings", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(history_count, 0);
+        assert_eq!(embeddings, 0);
+
+        // But the row survives as a tombstone so the deletion can propagate.
+        let change = store.changes_since(None, 100).unwrap();
+        assert_eq!(change.len(), 1);
+        assert_eq!(change[0].id, t.id);
+        assert!(change[0].deleted_at.is_some());
     }
 
     #[test]
@@ -1516,5 +1726,132 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ── sync ────────────────────────────────────────────────────────────────
+
+    fn change_of(t: &Thought) -> ThoughtChange {
+        ThoughtChange {
+            id: t.id,
+            text: t.text.clone(),
+            created_at: t.created_at,
+            updated_at: t.updated_at,
+            settled_at: None,
+            deleted_at: None,
+        }
+    }
+
+    #[test]
+    fn create_and_edit_mark_rows_dirty() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        let a = store.create("alpha").unwrap();
+        let b = store.create("beta").unwrap();
+        // Both are local changes awaiting push.
+        let pending = store.pending_changes(100).unwrap();
+        assert_eq!(pending.len(), 2);
+
+        // Marking them synced clears the outbox.
+        store
+            .mark_synced(&[(a.id, a.updated_at), (b.id, b.updated_at)])
+            .unwrap();
+        assert!(store.pending_changes(100).unwrap().is_empty());
+
+        // A later edit re-dirties just that row.
+        let a2 = store.update_thought(a.id, "alpha edited").unwrap();
+        let pending = store.pending_changes(100).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, a.id);
+        assert_eq!(pending[0].updated_at, a2.updated_at);
+    }
+
+    #[test]
+    fn apply_remote_inserts_then_respects_last_writer_wins() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        let id = Uuid::new_v4();
+        let remote = ThoughtChange {
+            id,
+            text: "from another device".into(),
+            created_at: 1_000,
+            updated_at: 1_000,
+            settled_at: None,
+            deleted_at: None,
+        };
+        // Absent locally → inserted, and it lands clean (not in the outbox).
+        assert!(store.apply_remote(&remote).unwrap());
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert!(store.pending_changes(100).unwrap().is_empty());
+
+        // An older change for the same id is ignored.
+        let older = ThoughtChange {
+            text: "stale".into(),
+            updated_at: 500,
+            ..remote.clone()
+        };
+        assert!(!store.apply_remote(&older).unwrap());
+        assert_eq!(store.list().unwrap()[0].text, "from another device");
+
+        // A strictly newer change wins.
+        let newer = ThoughtChange {
+            text: "newer wins".into(),
+            updated_at: 2_000,
+            ..remote.clone()
+        };
+        assert!(store.apply_remote(&newer).unwrap());
+        assert_eq!(store.list().unwrap()[0].text, "newer wins");
+        // Re-applying it is an idempotent no-op (equal updated_at).
+        assert!(!store.apply_remote(&newer).unwrap());
+    }
+
+    #[test]
+    fn apply_remote_tombstone_deletes_locally() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        let t = store.create("here then gone").unwrap();
+        let tombstone = ThoughtChange {
+            deleted_at: Some(t.updated_at + 1),
+            updated_at: t.updated_at + 1,
+            ..change_of(&t)
+        };
+        assert!(store.apply_remote(&tombstone).unwrap());
+        assert!(store.list().unwrap().is_empty());
+        // The tombstone is now clean locally (came from the peer).
+        assert!(store.pending_changes(100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn changes_since_is_a_gapless_keyset_feed() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        for i in 0..5 {
+            store.create(&format!("t{i}")).unwrap();
+        }
+        // Page through the whole feed two at a time using the keyset cursor.
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = store.changes_since(cursor, 2).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            cursor = Some(SyncCursor::after(page.last().unwrap()));
+            seen.extend(page.iter().map(|c| c.id));
+            if seen.len() >= 5 {
+                break;
+            }
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 5, "every row seen exactly once, no gaps/dupes");
+    }
+
+    #[test]
+    fn mark_synced_keeps_a_concurrently_edited_row_dirty() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        let t = store.create("v1").unwrap();
+        // Simulate: read the row for push, then it's edited before the ack.
+        let edited = store.update_thought(t.id, "v2").unwrap();
+        // Ack the OLD version — must not clear the (now newer) dirty row.
+        store.mark_synced(&[(t.id, t.updated_at)]).unwrap();
+        let pending = store.pending_changes(100).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].updated_at, edited.updated_at);
     }
 }
