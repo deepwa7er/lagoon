@@ -8,14 +8,16 @@ use uuid::Uuid;
 
 use crate::embed::{TextEmbedder, blob_to_vector, dot, vector_to_blob};
 use crate::error::{Error, Result};
+use crate::saved_search::SavedSearch;
 use crate::search::{
     MATCH_MARK_END, MATCH_MARK_START, SNIPPET_TOKENS, ThoughtMatch, build_match_query,
     extract_ranges,
 };
 use crate::sync::{SyncCursor, ThoughtChange};
+use crate::tags::parse_tags;
 use crate::thought::{EditEntry, Thought};
 
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 /// Semantic results below this cosine similarity are dropped: they read as
 /// noise to the user. Initial heuristic calibrated against the Phase 3
@@ -133,6 +135,7 @@ impl ThoughtStore {
                 params![id.as_bytes().as_slice(), vector_to_blob(&vector)],
             )?;
         }
+        reconcile_tags(&tx, id, text)?;
         tx.commit()?;
         Ok(Thought {
             id,
@@ -205,6 +208,7 @@ impl ThoughtStore {
             }
         }
 
+        reconcile_tags(&tx, id, new_text)?;
         tx.commit()?;
 
         Ok(Thought {
@@ -226,7 +230,8 @@ impl ThoughtStore {
     /// push on the next sync.
     pub fn delete_thought(&self, id: Uuid) -> Result<()> {
         let now = now_unix_millis();
-        let affected = self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        let affected = tx.execute(
             "UPDATE thoughts SET deleted_at = ?1, updated_at = ?1, dirty = 1
              WHERE id = ?2 AND deleted_at IS NULL",
             params![now, id.as_bytes().as_slice()],
@@ -234,10 +239,13 @@ impl ThoughtStore {
         if affected == 0 {
             return Err(Error::NotFound { id });
         }
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM embeddings WHERE thought_id = ?1",
             params![id.as_bytes().as_slice()],
         )?;
+        // A tombstone carries no tags; clearing them also GCs any now-orphan tag.
+        reconcile_tags(&tx, id, "")?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -739,6 +747,14 @@ impl ThoughtStore {
                 )?;
             }
         }
+        // Mirror tags from the incoming text (none for a tombstone) so a synced
+        // thought's tags match its text on this device too.
+        let tag_text = if change.deleted_at.is_some() {
+            ""
+        } else {
+            change.text.as_str()
+        };
+        reconcile_tags(&tx, change.id, tag_text)?;
         tx.commit()?;
         Ok(true)
     }
@@ -756,6 +772,102 @@ impl ThoughtStore {
             )?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    // ── tags & saved searches ────────────────────────────────────────────────
+
+    /// Tag names beginning with `prefix` (ASCII case-insensitive), most-used
+    /// first — for `#tag` autocomplete. An empty prefix returns the most-used
+    /// tags overall. Only tags currently applied to a live thought appear.
+    pub fn tags_with_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<String>> {
+        let pattern = format!("{}%", escape_like(prefix));
+        let mut stmt = self.conn.prepare(
+            "SELECT t.name
+             FROM tags t
+             JOIN thought_tags tt ON tt.tag_id = t.id
+             JOIN thoughts th ON th.id = tt.thought_id AND th.deleted_at IS NULL
+             WHERE t.name LIKE ?1 ESCAPE '\\'
+             GROUP BY t.id
+             ORDER BY COUNT(*) DESC, t.name COLLATE NOCASE ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![pattern, i64::try_from(limit).unwrap_or(i64::MAX)],
+            |row| row.get::<_, String>(0),
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Live thoughts carrying the tag `name` (case-insensitive), newest first —
+    /// the "tap a tag to filter" path.
+    pub fn thoughts_with_tag(&self, name: &str, limit: usize) -> Result<Vec<Thought>> {
+        let now = now_unix_millis();
+        let mut stmt = self.conn.prepare(
+            "SELECT th.id, th.text, th.created_at, th.updated_at, th.settled_at
+             FROM thoughts th
+             JOIN thought_tags tt ON tt.thought_id = th.id
+             JOIN tags t ON t.id = tt.tag_id
+             WHERE t.name = ?1 AND th.deleted_at IS NULL
+             ORDER BY th.created_at DESC, th.id DESC
+             LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![name, i64::try_from(limit).unwrap_or(i64::MAX)])?;
+        let raw = collect_thought_rows(&mut rows)?;
+        Ok(raw.into_iter().map(|r| into_thought(r, now)).collect())
+    }
+
+    /// Save a named query (a pinned search). `query` is stored verbatim — the
+    /// caller routes it the same way the search box does (a `#tag` filters by
+    /// tag; anything else runs combined search).
+    pub fn create_saved_search(&self, name: &str, query: &str) -> Result<SavedSearch> {
+        let id = Uuid::new_v4();
+        let now = now_unix_millis();
+        self.conn.execute(
+            "INSERT INTO saved_searches (id, name, query, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![id.as_bytes().as_slice(), name, query, now],
+        )?;
+        Ok(SavedSearch {
+            id,
+            name: name.to_owned(),
+            query: query.to_owned(),
+            created_at: now,
+        })
+    }
+
+    /// Every saved search, oldest first.
+    pub fn list_saved_searches(&self) -> Result<Vec<SavedSearch>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, query, created_at FROM saved_searches
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id_blob, name, query, created_at) = row?;
+            out.push(SavedSearch {
+                id: uuid_from_blob(&id_blob)?,
+                name,
+                query,
+                created_at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Delete a saved search. Removing one that doesn't exist is a no-op.
+    pub fn delete_saved_search(&self, id: Uuid) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM saved_searches WHERE id = ?1",
+            params![id.as_bytes().as_slice()],
+        )?;
         Ok(())
     }
 
@@ -875,11 +987,51 @@ impl ThoughtStore {
             )?;
         }
 
+        if current < 6 {
+            self.migrate_to_v6()?;
+        }
+
         // Stamp the schema version. `user_version` is a PRAGMA, so we cannot
         // bind it as a parameter; building the statement with an integer
         // literal is safe.
         self.conn
             .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+        Ok(())
+    }
+
+    /// v6: the inline-`#tag` mirror tables (`tags`/`thought_tags`, reconciled
+    /// from thought text on every write) and `saved_searches` (pinned queries,
+    /// local to this store). Backfills tag links from existing thought text —
+    /// `SQLite` can't parse `#tags`, so it reuses the write-path reconciler.
+    fn migrate_to_v6(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE tags (
+                id   INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE COLLATE NOCASE
+            );
+            CREATE TABLE thought_tags (
+                thought_id BLOB    NOT NULL REFERENCES thoughts(id) ON DELETE CASCADE,
+                tag_id     INTEGER NOT NULL REFERENCES tags(id)     ON DELETE CASCADE,
+                PRIMARY KEY (thought_id, tag_id)
+            );
+            CREATE INDEX thought_tags_tag_idx ON thought_tags (tag_id);
+            CREATE TABLE saved_searches (
+                id         BLOB    PRIMARY KEY NOT NULL,
+                name       TEXT    NOT NULL,
+                query      TEXT    NOT NULL,
+                created_at INTEGER NOT NULL
+            );",
+        )?;
+        let existing: Vec<(Vec<u8>, String)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, text FROM thoughts WHERE deleted_at IS NULL")?;
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (id_blob, text) in existing {
+            reconcile_tags(&self.conn, uuid_from_blob(&id_blob)?, &text)?;
+        }
         Ok(())
     }
 }
@@ -953,6 +1105,55 @@ fn now_unix_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock is before UNIX epoch");
     i64::try_from(duration.as_millis()).expect("system clock is past year 292,278,994")
+}
+
+/// Reconcile the `tags`/`thought_tags` mirror for one thought from its text.
+///
+/// Sets the thought's tag links to exactly the `#tag`s in `text` (de-duplicated,
+/// and case-folded across thoughts via the `NOCASE` unique on `tags.name`), then
+/// drops any tag no thought references anymore, so autocomplete only ever offers
+/// tags in use. Passing `""` clears a thought's tags (deletes / tombstones).
+/// Runs inside the caller's transaction.
+fn reconcile_tags(conn: &Connection, thought_id: Uuid, text: &str) -> Result<()> {
+    let id_blob = thought_id.as_bytes().as_slice();
+    conn.execute(
+        "DELETE FROM thought_tags WHERE thought_id = ?1",
+        params![id_blob],
+    )?;
+    for name in parse_tags(text) {
+        conn.execute(
+            "INSERT INTO tags (name) VALUES (?1) ON CONFLICT(name) DO NOTHING",
+            params![name],
+        )?;
+        let tag_id: i64 = conn.query_row(
+            "SELECT id FROM tags WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO thought_tags (thought_id, tag_id) VALUES (?1, ?2)",
+            params![id_blob, tag_id],
+        )?;
+    }
+    conn.execute(
+        "DELETE FROM tags WHERE id NOT IN (SELECT tag_id FROM thought_tags)",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Escape `LIKE` wildcards (`%`, `_`) and the escape char so a literal prefix —
+/// a tag may legitimately contain `_` — matches literally. Pair with
+/// `ESCAPE '\'` in the query.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1854,6 +2055,9 @@ mod tests {
     fn mark_synced_keeps_a_concurrently_edited_row_dirty() {
         let store = ThoughtStore::open_in_memory().unwrap();
         let t = store.create("v1").unwrap();
+        // The edit must land in a later millisecond than the create so its
+        // updated_at differs — that's the whole point of the ack check below.
+        sleep(Duration::from_millis(2));
         // Simulate: read the row for push, then it's edited before the ack.
         let edited = store.update_thought(t.id, "v2").unwrap();
         // Ack the OLD version — must not clear the (now newer) dirty row.
@@ -1861,5 +2065,167 @@ mod tests {
         let pending = store.pending_changes(100).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].updated_at, edited.updated_at);
+    }
+
+    // ── tags & saved searches ────────────────────────────────────────────────
+
+    fn tag_count(store: &ThoughtStore) -> i64 {
+        store
+            .conn
+            .query_row("SELECT count(*) FROM tags", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn create_mirrors_tags_from_text() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        store.create("ship the #idea and the #plan").unwrap();
+        let mut tags = store.tags_with_prefix("", 10).unwrap();
+        tags.sort();
+        assert_eq!(tags, vec!["idea", "plan"]);
+    }
+
+    #[test]
+    fn editing_text_adds_and_removes_tags_and_gcs_orphans() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        let t = store.create("first #alpha").unwrap();
+        assert_eq!(store.tags_with_prefix("", 10).unwrap(), vec!["alpha"]);
+
+        store.update_thought(t.id, "now #beta only").unwrap();
+        // alpha is orphaned and GC'd; beta is present.
+        assert_eq!(store.tags_with_prefix("", 10).unwrap(), vec!["beta"]);
+        assert_eq!(tag_count(&store), 1);
+    }
+
+    #[test]
+    fn tags_are_case_folded_across_thoughts() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        let a = store.create("one #Idea").unwrap();
+        let b = store.create("two #idea").unwrap();
+        // A single tag, first casing kept.
+        assert_eq!(store.tags_with_prefix("", 10).unwrap(), vec!["Idea"]);
+        // Both thoughts filter under it, case-insensitively.
+        let ids: Vec<Uuid> = store
+            .thoughts_with_tag("IDEA", 10)
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(ids.contains(&a.id) && ids.contains(&b.id));
+    }
+
+    #[test]
+    fn tags_with_prefix_filters_and_orders_by_use() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        store.create("#work a").unwrap();
+        store.create("#work b").unwrap();
+        store.create("#worry c").unwrap();
+        store.create("#home d").unwrap();
+        // Prefix "wo" matches work + worry; work is used twice, so it leads.
+        assert_eq!(
+            store.tags_with_prefix("wo", 10).unwrap(),
+            vec!["work", "worry"]
+        );
+    }
+
+    #[test]
+    fn tags_with_prefix_escapes_underscore_wildcard() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        store.create("#a_b").unwrap();
+        store.create("#axb").unwrap();
+        // "a_" must match literally (a, underscore), not "a<any>".
+        assert_eq!(store.tags_with_prefix("a_", 10).unwrap(), vec!["a_b"]);
+    }
+
+    #[test]
+    fn thoughts_with_tag_excludes_deleted() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        let keep = store.create("keep #x").unwrap();
+        let gone = store.create("drop #x").unwrap();
+        store.delete_thought(gone.id).unwrap();
+        let hits = store.thoughts_with_tag("x", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, keep.id);
+        // The remaining thought keeps the tag alive.
+        assert_eq!(store.tags_with_prefix("", 10).unwrap(), vec!["x"]);
+    }
+
+    #[test]
+    fn deleting_last_tagged_thought_gcs_the_tag() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        let only = store.create("solo #unique").unwrap();
+        assert_eq!(tag_count(&store), 1);
+        store.delete_thought(only.id).unwrap();
+        assert_eq!(tag_count(&store), 0);
+    }
+
+    #[test]
+    fn apply_remote_mirrors_tags() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        let remote = ThoughtChange {
+            id: Uuid::new_v4(),
+            text: "synced #frompeer".into(),
+            created_at: 1_000,
+            updated_at: 1_000,
+            settled_at: None,
+            deleted_at: None,
+        };
+        store.apply_remote(&remote).unwrap();
+        assert_eq!(store.tags_with_prefix("", 10).unwrap(), vec!["frompeer"]);
+
+        // A tombstone clears them.
+        let tombstone = ThoughtChange {
+            deleted_at: Some(2_000),
+            updated_at: 2_000,
+            ..remote
+        };
+        store.apply_remote(&tombstone).unwrap();
+        assert!(store.tags_with_prefix("", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn migration_backfills_tags_from_existing_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("buoy.sqlite");
+        {
+            let store = ThoughtStore::open(&path).unwrap();
+            store.create("legacy #backfilled note").unwrap();
+            // Drop the v6 tables and pretend the file is still at v5, leaving
+            // the tagged thought text in place.
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE thought_tags; DROP TABLE tags; DROP TABLE saved_searches;
+                     PRAGMA user_version = 5;",
+                )
+                .unwrap();
+        }
+        // Reopening runs the v6 migration, which backfills tags from text.
+        let store = ThoughtStore::open(&path).unwrap();
+        assert_eq!(
+            store.tags_with_prefix("", 10).unwrap(),
+            vec!["backfilled"]
+        );
+    }
+
+    #[test]
+    fn saved_search_crud() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        let a = store.create_saved_search("Work", "#work").unwrap();
+        let b = store.create_saved_search("Milk", "milk OR dairy").unwrap();
+
+        let all = store.list_saved_searches().unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|s| *s == a));
+        assert!(all.iter().any(|s| s.query == "milk OR dairy"));
+
+        store.delete_saved_search(b.id).unwrap();
+        let all = store.list_saved_searches().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, a.id);
+
+        // Deleting a missing one is a no-op.
+        store.delete_saved_search(Uuid::new_v4()).unwrap();
+        assert_eq!(store.list_saved_searches().unwrap().len(), 1);
     }
 }
