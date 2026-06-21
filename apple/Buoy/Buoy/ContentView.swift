@@ -22,6 +22,11 @@ final class ThoughtListModel {
     var suggestions: [ThoughtMatch] = []
     /// Related thoughts expanded under stream rows, keyed by thought id.
     var relatedExpanded: [String: [ThoughtMatch]] = [:]
+    /// Pinned saved searches, oldest first.
+    var savedSearches: [SavedSearch] = []
+    /// `#tag` autocomplete suggestions for the tag currently being typed at the
+    /// end of the composer draft; empty when there's no in-progress tag token.
+    var tagSuggestions: [String] = []
 
     /// Live sync state, surfaced in the UI. `lastSynced` is the time of the last
     /// *successful* reconcile and persists across later failures.
@@ -36,6 +41,7 @@ final class ThoughtListModel {
     private var isLoadingOlder = false
     private var searchTask: Task<Void, Never>?
     private var suggestionTask: Task<Void, Never>?
+    private var tagSuggestTask: Task<Void, Never>?
     /// The exact draft for which the user dismissed the suggestion strip;
     /// it stays hidden until the draft text changes again.
     private var dismissedSuggestionsDraft: String?
@@ -51,6 +57,7 @@ final class ThoughtListModel {
             let path = try BuoyStore.url().path
             store = try ThoughtStore.open(path: path)
             await refresh()
+            await loadSavedSearches()
             attachEmbedderInBackground()
             syncNow()
         } catch {
@@ -199,7 +206,14 @@ final class ThoughtListModel {
     private func runSearch(_ query: String) async {
         guard let store else { return }
         do {
-            searchResults = try store.searchCombined(query: query, limit: 50)
+            if let tag = Self.tagQuery(query) {
+                // A bare `#tag` query filters by tag — full thoughts, no snippet.
+                searchResults = try store.thoughtsWithTag(name: tag, limit: 50).map {
+                    ThoughtMatch(thought: $0, snippet: $0.text, ranges: [])
+                }
+            } else {
+                searchResults = try store.searchCombined(query: query, limit: 50)
+            }
         } catch {
             errorMessage = "Search failed: \(error.localizedDescription)"
         }
@@ -306,6 +320,83 @@ final class ThoughtListModel {
         }
     }
 
+    // ── tags & saved searches ─────────────────────────────────────────────────
+
+    func loadSavedSearches() async {
+        guard let store else { return }
+        savedSearches = (try? store.listSavedSearches()) ?? []
+    }
+
+    /// Pin the current query under `name`.
+    func pinSearch(name: String, query: String) async {
+        guard let store else { return }
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty, !trimmedQuery.isEmpty else { return }
+        do {
+            _ = try store.createSavedSearch(name: trimmedName, query: trimmedQuery)
+            await loadSavedSearches()
+        } catch {
+            errorMessage = "Failed to pin search: \(error.localizedDescription)"
+        }
+    }
+
+    func unpin(_ id: String) async {
+        guard let store else { return }
+        try? store.deleteSavedSearch(id: id)
+        await loadSavedSearches()
+    }
+
+    /// Debounced `#tag` autocomplete for the tag being typed at the end of the
+    /// draft. Empties the suggestions when there's no in-progress tag token.
+    func suggestTagsDebounced(draft: String) {
+        tagSuggestTask?.cancel()
+        guard let prefix = Self.activeTagPrefix(draft) else {
+            tagSuggestions = []
+            return
+        }
+        tagSuggestTask = Task {
+            try? await Task.sleep(for: .milliseconds(80))
+            guard !Task.isCancelled, let store else { return }
+            tagSuggestions = (try? store.tagsWithPrefix(prefix: prefix, limit: 8)) ?? []
+        }
+    }
+
+    /// Replace the in-progress `#tag` at the end of the draft with `#name `.
+    func completeTag(_ name: String) {
+        guard let hashIdx = draft.lastIndex(of: "#") else { return }
+        draft = String(draft[..<hashIdx]) + "#\(name) "
+        tagSuggestions = []
+    }
+
+    /// The bare tag name of a `#tag` filter query, or nil for free-text search.
+    static func tagQuery(_ trimmed: String) -> String? {
+        guard trimmed.hasPrefix("#") else { return nil }
+        let body = trimmed.dropFirst()
+        guard !body.isEmpty, body.allSatisfy(isTagChar) else { return nil }
+        var name = String(body)
+        while name.hasSuffix("-") { name.removeLast() }
+        return name.isEmpty ? nil : name
+    }
+
+    /// The prefix of the `#tag` being typed at the very end of `draft` (the text
+    /// after the last `#`), or nil when the trailing text isn't an in-progress
+    /// tag (a finished tag, no `#`, or a `#` not on a word boundary).
+    static func activeTagPrefix(_ draft: String) -> String? {
+        guard let hashIdx = draft.lastIndex(of: "#") else { return nil }
+        let after = draft[draft.index(after: hashIdx)...]
+        guard after.allSatisfy(isTagChar) else { return nil }
+        if hashIdx != draft.startIndex {
+            let prev = draft[draft.index(before: hashIdx)]
+            if prev.isLetter || prev.isNumber || prev == "_" || prev == "#" { return nil }
+        }
+        return String(after)
+    }
+
+    private static func isTagChar(_ c: Character) -> Bool {
+        c.isLetter || c.isNumber || c == "_" || c == "-"
+    }
+
 }
 
 struct ContentView: View {
@@ -315,6 +406,8 @@ struct ContentView: View {
     /// after `reveal` has paged the thought into the loaded window, so the
     /// row exists by the time the scroll fires.
     @State private var scrollTarget: String?
+    @State private var showingPinAlert = false
+    @State private var pinName = ""
     @FocusState private var composerFocused: Bool
     @Environment(\.scenePhase) private var scenePhase
     #if os(macOS)
@@ -327,6 +420,13 @@ struct ContentView: View {
                 if model.status.isOffline {
                     OfflineBanner()
                 }
+                if !model.savedSearches.isEmpty {
+                    SavedSearchBar(
+                        items: model.savedSearches,
+                        onRun: { searchText = $0.query },
+                        onUnpin: { id in Task { await model.unpin(id) } }
+                    )
+                }
                 if searchText.isEmpty {
                     stream
                     Divider()
@@ -337,6 +437,13 @@ struct ContentView: View {
                             onSelect: { match in revealInStream(match.thought.id) },
                             onDismiss: { model.dismissSuggestions() }
                         )
+                    }
+
+                    if !model.tagSuggestions.isEmpty {
+                        TagSuggestionStrip(tags: model.tagSuggestions) { name in
+                            model.completeTag(name)
+                            composerFocused = true
+                        }
                     }
 
                     if model.isEditing {
@@ -361,10 +468,22 @@ struct ContentView: View {
             }
             .onChange(of: model.draft) { _, draft in
                 model.suggestDebounced(draft: draft)
+                model.suggestTagsDebounced(draft: draft)
             }
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     SyncStatusButton(model: model)
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    if !searchText.isEmpty {
+                        Button {
+                            pinName = searchText
+                            showingPinAlert = true
+                        } label: {
+                            Image(systemName: "pin")
+                        }
+                        .help("Pin this search")
+                    }
                 }
             }
         }
@@ -406,6 +525,25 @@ struct ContentView: View {
             },
             message: {
                 Text(model.errorMessage ?? "")
+            }
+        )
+        .alert("Pin Search", isPresented: $showingPinAlert) {
+            TextField("Name", text: $pinName)
+            Button("Pin") {
+                let query = searchText
+                Task { await model.pinSearch(name: pinName, query: query) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Name this pinned search.")
+        }
+        .environment(
+            \.openURL,
+            OpenURLAction { url in
+                guard url.scheme == "buoytag" else { return .systemAction }
+                let raw = String(url.absoluteString.dropFirst("buoytag:".count))
+                searchText = "#\(raw.removingPercentEncoding ?? raw)"
+                return .handled
             }
         )
     }
@@ -685,6 +823,101 @@ private struct SearchResultRow: View {
     }
 }
 
+/// `#tag` matcher mirroring the core parser: `#` on a word boundary, then a body
+/// of letters/digits/`_`/`-` that begins with a letter/digit/`_`.
+private let tagRegex = /(?:^|[^\p{L}\p{N}_#])#(?<name>[\p{L}\p{N}_][\p{L}\p{N}_-]*)/
+
+/// Render thought text with its `#tag` tokens accent-colored and linked
+/// (`buoytag:<name>`); the link scheme is intercepted by an `OpenURLAction` in
+/// `ContentView` to filter by the tag. Tapping anywhere else still edits the row.
+private func taggedText(_ text: String) -> AttributedString {
+    var result = AttributedString()
+    var idx = text.startIndex
+    for match in text.matches(of: tagRegex) {
+        let nameStart = match.output.name.startIndex
+        let hashIdx = text.index(before: nameStart)
+        if idx < hashIdx { result += AttributedString(text[idx..<hashIdx]) }
+        var name = String(match.output.name)
+        while name.hasSuffix("-") { name.removeLast() }
+        var chip = AttributedString(text[hashIdx..<match.output.name.endIndex])
+        chip.foregroundColor = .accentColor
+        if let encoded = name.addingPercentEncoding(withAllowedCharacters: .alphanumerics),
+            let url = URL(string: "buoytag:\(encoded)")
+        {
+            chip.link = url
+        }
+        result += chip
+        idx = match.output.name.endIndex
+    }
+    if idx < text.endIndex { result += AttributedString(text[idx...]) }
+    return result
+}
+
+/// Horizontal bar of pinned searches: tap a chip to run it, long-press to unpin.
+private struct SavedSearchBar: View {
+    let items: [SavedSearch]
+    let onRun: (SavedSearch) -> Void
+    let onUnpin: (String) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(items, id: \.id) { item in
+                    Button { onRun(item) } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "pin.fill").imageScale(.small)
+                            Text(item.name).lineLimit(1)
+                        }
+                        .font(.caption)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.accentColor.opacity(0.10), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .contextMenu {
+                        Button(role: .destructive) {
+                            onUnpin(item.id)
+                        } label: {
+                            Label("Unpin", systemImage: "pin.slash")
+                        }
+                    }
+                    .help(item.query)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+        }
+    }
+}
+
+/// Thin strip of `#tag` autocomplete suggestions above the composer; tap one to
+/// complete the tag being typed.
+private struct TagSuggestionStrip: View {
+    let tags: [String]
+    let onSelect: (String) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                Image(systemName: "number").imageScale(.small).foregroundStyle(.secondary)
+                ForEach(tags, id: \.self) { tag in
+                    Button { onSelect(tag) } label: {
+                        Text("#\(tag)")
+                            .font(.caption)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color.accentColor.opacity(0.10), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+        }
+        .background(.bar)
+    }
+}
+
 private struct ThoughtRow: View {
     let thought: Thought
     let relatedExpanded: Bool
@@ -692,7 +925,7 @@ private struct ThoughtRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(thought.text)
+            Text(taggedText(thought.text))
             HStack(spacing: 5) {
                 if !thought.isSettled {
                     Circle()

@@ -9,10 +9,11 @@ import Foundation
 // new cursor. Capture works fully offline; a sync just reconciles when we can
 // reach the server. See crates/server/src/api.rs and crates/core/src/sync.rs.
 
-/// Where the buoy server lives. Plain HTTP over the tailnet, which encrypts
-/// transport (the same model the web app and the rest of the suite use). The
-/// app carries an ATS exception for this host so iOS/macOS permit it.
-let buoyServerURL = URL(string: "http://deepwa7er.tailcfab97.ts.net:8092")!
+/// Where the buoy server lives — the breakwater HTTPS front door on the tailnet
+/// (a valid wildcard cert, so no ATS exception is needed). buoy binds loopback
+/// on the VPS; breakwater serves it at this name, the same `*.internal` scheme
+/// the web app and the rest of the suite use.
+let buoyServerURL = URL(string: "https://buoy.internal.deepwa7er.com")!
 
 /// How many local changes to push per sync. A personal store fits in one tick;
 /// if there are more, the next tick drains the rest.
