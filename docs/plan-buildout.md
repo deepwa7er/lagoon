@@ -268,7 +268,7 @@ write-lock between the two connections waits rather than failing with
 
 **Goal:** Replace the *concept* of folders with lightweight tags and pinned queries.
 
-### Realized (2026-06-20) — core + server + web (Apple UI pending)
+### Realized (2026-06-20) — complete across core + server + web + Apple
 
 Platforms are now **iOS + web** (Linux native dropped, see the Direction
 update), so "move together" means core + web + Apple.
@@ -287,8 +287,19 @@ update), so "move together" means core + web + Apple.
   bar. Decision taken: tag-chip tap reuses the search view; saved searches are
   local-first.
 
-**Remaining — Phase 7c:** the iOS/macOS SwiftUI UI (autocomplete, chips, saved
-searches), then the phase-boundary audit. Needs Xcode.
+- **Apple (iOS + macOS):** inline `#tag` chips (linked → filter via an
+  `OpenURLAction`), a `#tag` autocomplete strip above the composer, bare-`#tag`
+  query routing, and a pinned saved-search bar (pin via alert, unpin via
+  long-press). Built + run on the iOS 26.5 simulator (chips + saved bar render);
+  macOS builds from the same shared SwiftUI. One platform-idiomatic difference
+  from web: iOS autocompletes the tag at the draft's end, not an arbitrary caret.
+
+**Phase-boundary audit (passed):** no hacks; web/iOS/macOS at feature parity;
+no dead code; 82 core tests green. The web flows were browser-verified end to
+end (9/9); the iOS UI was visually verified (full interaction-driving would need
+XCUITest). While here, fixed a regression the breakwater migration introduced —
+the Apple sync URL pointed at the now-dead `tailnet:8092` and now uses
+`https://buoy.internal.deepwa7er.com`.
 
 ### Rust core work
 - `tags` table + `thought_tags` join
