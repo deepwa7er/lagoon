@@ -29,3 +29,10 @@ export interface EditEntry {
   text: string;
   archived_at: number;
 }
+
+export interface SavedSearch {
+  id: string;
+  name: string;
+  query: string;
+  created_at: number;
+}

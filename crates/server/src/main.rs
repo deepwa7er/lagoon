@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use axum::Router;
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use clap::Parser;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -89,6 +89,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/thoughts/{id}/history", get(api::history))
         .route("/api/search", get(api::search))
         .route("/api/related", post(api::related_to_draft))
+        .route("/api/tags", get(api::list_tags))
+        .route("/api/tags/{name}/thoughts", get(api::thoughts_by_tag))
+        .route(
+            "/api/saved-searches",
+            get(api::list_saved_searches).post(api::create_saved_search),
+        )
+        .route("/api/saved-searches/{id}", delete(api::delete_saved_search))
         .route("/api/sync", post(api::sync))
         .route("/healthz", get(api::healthz))
         .fallback_service(serve_dir)

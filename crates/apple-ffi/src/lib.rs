@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 
 use buoy_core::{
     Cursor as CoreCursor, Error as CoreError, MatchRange as CoreMatchRange, MiniLmEmbedder,
-    Page as CorePage, SyncCursor as CoreSyncCursor, Thought as CoreThought,
-    ThoughtChange as CoreThoughtChange, ThoughtMatch as CoreThoughtMatch,
+    Page as CorePage, SavedSearch as CoreSavedSearch, SyncCursor as CoreSyncCursor,
+    Thought as CoreThought, ThoughtChange as CoreThoughtChange, ThoughtMatch as CoreThoughtMatch,
     ThoughtStore as CoreStore,
 };
 use uuid::Uuid;
@@ -199,6 +199,28 @@ impl ThoughtChange {
 pub struct SyncAck {
     pub id: String,
     pub updated_at: i64,
+}
+
+/// Swift-facing pinned query. `query` is the raw saved text — a `#tag` (run as a
+/// tag filter) or free text (run through combined search), routed by the UI the
+/// same way the search box is.
+#[derive(uniffi::Record)]
+pub struct SavedSearch {
+    pub id: String,
+    pub name: String,
+    pub query: String,
+    pub created_at: i64,
+}
+
+impl From<CoreSavedSearch> for SavedSearch {
+    fn from(value: CoreSavedSearch) -> Self {
+        Self {
+            id: value.id.to_string(),
+            name: value.name,
+            query: value.query,
+            created_at: value.created_at,
+        }
+    }
 }
 
 /// Errors surfaced to Swift. `UniFFI` maps each variant to a case on a Swift
@@ -425,6 +447,50 @@ impl ThoughtStore {
             .collect::<Result<Vec<_>, _>>()?;
         let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
         guard.mark_synced(&pushed)?;
+        Ok(())
+    }
+
+    // ── tags & saved searches ─────────────────────────────────────────────────
+
+    /// Tag names beginning with `prefix` (case-insensitive), most-used first —
+    /// for `#tag` autocomplete. An empty prefix returns the most-used tags.
+    pub fn tags_with_prefix(&self, prefix: &str, limit: u32) -> Result<Vec<String>, FfiError> {
+        let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
+        Ok(guard.tags_with_prefix(prefix, limit as usize)?)
+    }
+
+    /// Live thoughts carrying the tag `name` (case-insensitive), newest first —
+    /// the "tap a tag to filter" path.
+    pub fn thoughts_with_tag(&self, name: &str, limit: u32) -> Result<Vec<Thought>, FfiError> {
+        let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
+        Ok(guard
+            .thoughts_with_tag(name, limit as usize)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Pin a named query.
+    pub fn create_saved_search(&self, name: &str, query: &str) -> Result<SavedSearch, FfiError> {
+        let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
+        Ok(guard.create_saved_search(name, query)?.into())
+    }
+
+    /// Every saved search, oldest first.
+    pub fn list_saved_searches(&self) -> Result<Vec<SavedSearch>, FfiError> {
+        let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
+        Ok(guard
+            .list_saved_searches()?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Unpin a saved search (a no-op if it's already gone).
+    pub fn delete_saved_search(&self, id: &str) -> Result<(), FfiError> {
+        let uuid = parse_id(id)?;
+        let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
+        guard.delete_saved_search(uuid)?;
         Ok(())
     }
 }

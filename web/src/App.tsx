@@ -1,10 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import * as api from "./api";
-import type { Thought, ThoughtMatch } from "./types";
+import type { SavedSearch, Thought, ThoughtMatch } from "./types";
+import { activeTagToken } from "./lib/tags";
+import { SavedSearches } from "./components/SavedSearches";
 import { Snippet } from "./components/Snippet";
 import { SuggestionStrip } from "./components/SuggestionStrip";
 import { ThoughtRow } from "./components/ThoughtRow";
+
+/** A bare `#tag` query (no spaces) routes to the tag filter instead of search. */
+const TAG_QUERY = /^#([\p{L}\p{N}_][\p{L}\p{N}_-]*)$/u;
 
 export function App() {
   const [thoughts, setThoughts] = useState<Thought[]>([]);
@@ -20,6 +25,14 @@ export function App() {
 
   const [related, setRelated] = useState<Record<string, ThoughtMatch[] | null>>({});
   const [error, setError] = useState<string | null>(null);
+
+  const [savedSearches, setSavedSearches] = useState<SavedSearch[]>([]);
+
+  // Composer #tag autocomplete: the token under the caret, its suggestions, and
+  // the highlighted option.
+  const [tagToken, setTagToken] = useState<{ prefix: string; start: number } | null>(null);
+  const [tagOptions, setTagOptions] = useState<string[]>([]);
+  const [tagActive, setTagActive] = useState(0);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -38,16 +51,37 @@ export function App() {
     void reload();
   }, [reload]);
 
+  // Pinned searches (non-critical; a failure just hides the bar).
+  const reloadSaved = useCallback(async () => {
+    try {
+      setSavedSearches(await api.listSavedSearches());
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    void reloadSaved();
+  }, [reloadSaved]);
+
   // Debounced search — swaps the stream for results while the box is non-empty.
+  // A bare `#tag` query filters by tag; anything else runs combined search.
   useEffect(() => {
     const q = query.trim();
     if (!q) {
       setResults(null);
       return;
     }
+    const tag = q.match(TAG_QUERY);
     const h = setTimeout(async () => {
       try {
-        setResults(await api.search(q));
+        if (tag) {
+          const name = tag[1].replace(/-+$/u, "");
+          const ths = await api.thoughtsByTag(name);
+          setResults(ths.map((t) => ({ thought: t, snippet: t.text, ranges: [] })));
+        } else {
+          setResults(await api.search(q));
+        }
       } catch (e) {
         setError(String(e instanceof Error ? e.message : e));
       }
@@ -72,6 +106,49 @@ export function App() {
     return () => clearTimeout(h);
   }, [draft, editingId]);
 
+  // Tag suggestions for the token under the caret (debounced, lightweight).
+  useEffect(() => {
+    if (!tagToken) {
+      setTagOptions([]);
+      return;
+    }
+    const h = setTimeout(async () => {
+      try {
+        setTagOptions(await api.tagsWithPrefix(tagToken.prefix, 8));
+        setTagActive(0);
+      } catch {
+        setTagOptions([]);
+      }
+    }, 80);
+    return () => clearTimeout(h);
+  }, [tagToken]);
+
+  const refreshTagToken = useCallback(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    setTagToken(activeTagToken(el.value, el.selectionStart ?? el.value.length));
+  }, []);
+
+  const completeTag = useCallback(
+    (name: string) => {
+      const el = textareaRef.current;
+      if (!el || !tagToken) return;
+      const caret = el.selectionStart ?? el.value.length;
+      const before = draft.slice(0, tagToken.start);
+      const insert = `#${name} `;
+      const next = before + insert + draft.slice(caret);
+      setDraft(next);
+      setTagToken(null);
+      setTagOptions([]);
+      const pos = before.length + insert.length;
+      requestAnimationFrame(() => {
+        el.focus();
+        el.setSelectionRange(pos, pos);
+      });
+    },
+    [draft, tagToken],
+  );
+
   const save = useCallback(async () => {
     const text = draft.trim();
     if (!text) return;
@@ -86,6 +163,7 @@ export function App() {
       setDraft("");
       setEditingId(null);
       setSuggestions([]);
+      setTagToken(null);
     } catch (e) {
       setError(String(e instanceof Error ? e.message : e));
     }
@@ -160,7 +238,63 @@ export function App() {
     document.getElementById(`t-${id}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, []);
 
+  // Clicking a #tag (in the stream) filters by it.
+  const onTagClick = useCallback((tag: string) => {
+    setQuery(`#${tag}`);
+  }, []);
+
+  const runSaved = useCallback((s: SavedSearch) => setQuery(s.query), []);
+
+  const deleteSaved = useCallback(
+    async (id: string) => {
+      try {
+        await api.deleteSavedSearch(id);
+        await reloadSaved();
+      } catch (e) {
+        setError(String(e instanceof Error ? e.message : e));
+      }
+    },
+    [reloadSaved],
+  );
+
+  const pinSearch = useCallback(async () => {
+    const q = query.trim();
+    if (!q) return;
+    const name = window.prompt("Name this pinned search:", q)?.trim();
+    if (!name) return;
+    try {
+      await api.createSavedSearch(name, q);
+      await reloadSaved();
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    }
+  }, [query, reloadSaved]);
+
+  const acOpen = tagToken !== null && tagOptions.length > 0;
+
   const onComposerKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (acOpen) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setTagActive((i) => (i + 1) % tagOptions.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setTagActive((i) => (i - 1 + tagOptions.length) % tagOptions.length);
+        return;
+      }
+      if ((e.key === "Enter" || e.key === "Tab") && !e.nativeEvent.isComposing) {
+        e.preventDefault();
+        completeTag(tagOptions[tagActive]);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setTagToken(null);
+        return;
+      }
+    }
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
       void save();
@@ -187,11 +321,26 @@ export function App() {
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="search…"
+          placeholder="search… or #tag"
           aria-label="search"
-          className="ml-auto w-48 border border-rule bg-surface px-2 py-1 text-ink placeholder:text-ink-faint focus:border-accent focus:outline-none"
+          className="ml-auto w-44 border border-rule bg-surface px-2 py-1 text-ink placeholder:text-ink-faint focus:border-accent focus:outline-none"
         />
+        <button
+          type="button"
+          onClick={() => void pinSearch()}
+          disabled={!query.trim()}
+          title="pin this search"
+          className="border border-rule px-2 py-1 text-[11px] uppercase tracking-wide text-ink-muted hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-30"
+        >
+          pin
+        </button>
       </header>
+
+      <SavedSearches
+        items={savedSearches}
+        onRun={runSaved}
+        onDelete={(id) => void deleteSaved(id)}
+      />
 
       <div className="border-b border-rule px-4 py-3">
         <div className="mb-1.5 flex items-center gap-2 text-[11px] uppercase tracking-wide text-ink-muted">
@@ -206,15 +355,44 @@ export function App() {
             </button>
           )}
         </div>
-        <textarea
-          ref={textareaRef}
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={onComposerKey}
-          rows={2}
-          placeholder="what's on your mind?"
-          className="w-full resize-none border border-rule bg-surface px-3 py-2 text-ink placeholder:text-ink-faint focus:border-accent focus:outline-none"
-        />
+        <div className="relative">
+          <textarea
+            ref={textareaRef}
+            value={draft}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              refreshTagToken();
+            }}
+            onSelect={refreshTagToken}
+            onKeyDown={onComposerKey}
+            onBlur={() => window.setTimeout(() => setTagToken(null), 120)}
+            rows={2}
+            placeholder="what's on your mind? use #tags to organize"
+            className="w-full resize-none border border-rule bg-surface px-3 py-2 text-ink placeholder:text-ink-faint focus:border-accent focus:outline-none"
+          />
+          {acOpen && (
+            <ul className="absolute inset-x-0 top-full z-10 max-h-44 overflow-y-auto border border-rule-strong bg-surface text-[13px] shadow-lg">
+              {tagOptions.map((opt, i) => (
+                <li key={opt}>
+                  <button
+                    type="button"
+                    // mousedown (not click) + preventDefault keeps the textarea
+                    // focused so the completion lands before any blur.
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      completeTag(opt);
+                    }}
+                    className={`block w-full px-3 py-1 text-left ${
+                      i === tagActive ? "bg-surface-2 text-accent" : "text-ink-muted"
+                    }`}
+                  >
+                    #{opt}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
         <div className="mt-2 flex items-center gap-3">
           <button
             type="button"
@@ -275,11 +453,10 @@ export function App() {
                 onDelete={(id) => void remove(id)}
                 onToggleRelated={(th) => void toggleRelated(th)}
                 onPick={reveal}
+                onTagClick={onTagClick}
               />
             ))}
-            {loadingMore && (
-              <li className="px-4 py-3 text-center text-ink-faint">…</li>
-            )}
+            {loadingMore && <li className="px-4 py-3 text-center text-ink-faint">…</li>}
           </ul>
         )}
       </div>

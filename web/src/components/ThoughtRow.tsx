@@ -1,6 +1,7 @@
 import type { Thought, ThoughtMatch } from "../types";
 import { relTime } from "../lib/format";
 import { Snippet } from "./Snippet";
+import { TaggedText } from "./TaggedText";
 
 /** Per-row related-thoughts state: `undefined` = closed, `null` = loading. */
 export type RelatedState = ThoughtMatch[] | null | undefined;
@@ -13,6 +14,7 @@ export function ThoughtRow({
   onDelete,
   onToggleRelated,
   onPick,
+  onTagClick,
 }: {
   thought: Thought;
   editing: boolean;
@@ -21,6 +23,7 @@ export function ThoughtRow({
   onDelete: (id: string) => void;
   onToggleRelated: (t: Thought) => void;
   onPick: (id: string) => void;
+  onTagClick: (tag: string) => void;
 }) {
   const open = related !== undefined;
   return (
@@ -34,14 +37,15 @@ export function ThoughtRow({
           className={`mt-1.5 size-2 shrink-0 ${thought.is_settled ? "bg-transparent" : "bg-accent"}`}
           title={thought.is_settled ? "settled" : "live — edits overwrite until it settles"}
         />
-        <button
-          type="button"
+        {/* A div (not a button) so the inline tag chips aren't nested buttons;
+            the explicit "edit" action below covers keyboard users. */}
+        <div
           onClick={() => onEdit(thought)}
-          className="flex-1 whitespace-pre-wrap break-words text-left text-ink"
+          className="flex-1 cursor-text whitespace-pre-wrap break-words text-left text-ink"
           title="edit"
         >
-          {thought.text}
-        </button>
+          <TaggedText text={thought.text} onTagClick={onTagClick} />
+        </div>
         <div className="flex shrink-0 items-center gap-3 pt-px text-[11px] uppercase tracking-wide text-ink-faint">
           <time
             dateTime={new Date(thought.created_at).toISOString()}

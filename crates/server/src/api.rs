@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use buoy_core::{
-    Cursor, EditEntry, MatchRange, Page, SyncCursor, Thought, ThoughtChange, ThoughtMatch,
-    ThoughtStore,
+    Cursor, EditEntry, MatchRange, Page, SavedSearch, SyncCursor, Thought, ThoughtChange,
+    ThoughtMatch, ThoughtStore,
 };
 
 /// Shared handle to the canonical store.
@@ -27,6 +27,8 @@ pub type Shared = Arc<Mutex<ThoughtStore>>;
 const DEFAULT_SEARCH_LIMIT: usize = 50;
 const DEFAULT_DRAFT_SUGGESTIONS: usize = 3;
 const DEFAULT_RELATED: usize = 5;
+/// Default number of tag suggestions for `#tag` autocomplete.
+const DEFAULT_TAGS_LIMIT: usize = 12;
 /// Max changes returned in one `/api/sync` pull. A personal store fits in one
 /// round-trip; if a client ever gets exactly this many it simply syncs again.
 const SYNC_PAGE_LIMIT: usize = 1000;
@@ -119,6 +121,25 @@ impl From<&EditEntry> for EditEntryDto {
 
 fn matches_dto(matches: &[ThoughtMatch]) -> Vec<ThoughtMatchDto> {
     matches.iter().map(ThoughtMatchDto::from).collect()
+}
+
+#[derive(Serialize)]
+pub struct SavedSearchDto {
+    pub id: String,
+    pub name: String,
+    pub query: String,
+    pub created_at: i64,
+}
+
+impl From<&SavedSearch> for SavedSearchDto {
+    fn from(s: &SavedSearch) -> Self {
+        Self {
+            id: s.id.to_string(),
+            name: s.name.clone(),
+            query: s.query.clone(),
+            created_at: s.created_at,
+        }
+    }
 }
 
 /// A full thought row for sync, including tombstones (`deleted_at` set).
@@ -321,6 +342,76 @@ pub async fn history(
     let id = parse_id(&id)?;
     let entries = blocking(store, move |s| s.edit_history(id)).await?;
     Ok(Json(entries.iter().map(EditEntryDto::from).collect()))
+}
+
+// ── tags & saved searches ─────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct TagsQuery {
+    pub prefix: Option<String>,
+    pub limit: Option<usize>,
+}
+
+/// `GET /api/tags?prefix=&limit=` — tag names for `#tag` autocomplete,
+/// most-used first.
+pub async fn list_tags(
+    State(store): State<Shared>,
+    Query(q): Query<TagsQuery>,
+) -> Result<Json<Vec<String>>, AppError> {
+    let prefix = q.prefix.unwrap_or_default();
+    let limit = q.limit.unwrap_or(DEFAULT_TAGS_LIMIT);
+    let tags = blocking(store, move |s| s.tags_with_prefix(&prefix, limit)).await?;
+    Ok(Json(tags))
+}
+
+#[derive(Deserialize)]
+pub struct LimitQuery {
+    pub limit: Option<usize>,
+}
+
+/// `GET /api/tags/{name}/thoughts?limit=` — live thoughts carrying the tag,
+/// newest first (the "tap a tag to filter" path).
+pub async fn thoughts_by_tag(
+    State(store): State<Shared>,
+    Path(name): Path<String>,
+    Query(q): Query<LimitQuery>,
+) -> Result<Json<Vec<ThoughtDto>>, AppError> {
+    let limit = q.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+    let thoughts = blocking(store, move |s| s.thoughts_with_tag(&name, limit)).await?;
+    Ok(Json(thoughts.iter().map(ThoughtDto::from).collect()))
+}
+
+/// `GET /api/saved-searches` — pinned queries, oldest first.
+pub async fn list_saved_searches(
+    State(store): State<Shared>,
+) -> Result<Json<Vec<SavedSearchDto>>, AppError> {
+    let saved = blocking(store, ThoughtStore::list_saved_searches).await?;
+    Ok(Json(saved.iter().map(SavedSearchDto::from).collect()))
+}
+
+#[derive(Deserialize)]
+pub struct SavedSearchBody {
+    pub name: String,
+    pub query: String,
+}
+
+/// `POST /api/saved-searches` — pin a named query.
+pub async fn create_saved_search(
+    State(store): State<Shared>,
+    Json(body): Json<SavedSearchBody>,
+) -> Result<(StatusCode, Json<SavedSearchDto>), AppError> {
+    let saved = blocking(store, move |s| s.create_saved_search(&body.name, &body.query)).await?;
+    Ok((StatusCode::CREATED, Json(SavedSearchDto::from(&saved))))
+}
+
+/// `DELETE /api/saved-searches/{id}` — unpin a query (a no-op if it's gone).
+pub async fn delete_saved_search(
+    State(store): State<Shared>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let id = parse_id(&id)?;
+    blocking(store, move |s| s.delete_saved_search(id)).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
