@@ -268,6 +268,28 @@ write-lock between the two connections waits rather than failing with
 
 **Goal:** Replace the *concept* of folders with lightweight tags and pinned queries.
 
+### Realized (2026-06-20) — core + server + web (Apple UI pending)
+
+Platforms are now **iOS + web** (Linux native dropped, see the Direction
+update), so "move together" means core + web + Apple.
+
+- **Core (schema v6):** inline `#tag`s are the source of truth in the thought
+  text; the store mirrors them into `tags`/`thought_tags`, reconciled from text
+  on every write (the FTS pattern) and GC'd when unused — so tags ride the text
+  and sync for free. `tags_with_prefix` (autocomplete), `thoughts_with_tag`
+  (filter), and `saved_searches` (pinned queries, **local to each store**, not in
+  the sync feed; `query` is stored verbatim and routed like the search box). See
+  `crates/core/src/{tags.rs,store.rs}`.
+- **Server + FFI:** `/api/tags`, `/api/tags/{name}/thoughts`, saved-search CRUD;
+  matching UniFFI exports (`apple-ffi`), ready for SwiftUI.
+- **Web:** `#tag` autocomplete in the composer, inline tag chips (click →
+  filter), a bare `#tag` query routes to the tag filter, and a pinned-searches
+  bar. Decision taken: tag-chip tap reuses the search view; saved searches are
+  local-first.
+
+**Remaining — Phase 7c:** the iOS/macOS SwiftUI UI (autocomplete, chips, saved
+searches), then the phase-boundary audit. Needs Xcode.
+
 ### Rust core work
 - `tags` table + `thought_tags` join
 - Parser for `#tag` syntax in thought text
