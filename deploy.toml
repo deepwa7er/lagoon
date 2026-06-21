@@ -7,6 +7,9 @@
 # model download, and the systemd unit — is deploy/provision.sh, run once on
 # first setup. The musl toolchain is wired in .cargo/config.toml.
 name = "lagoon"
+# Service description for the fleet docs. Set here (not on a crate) because this
+# is a workspace — no single crate speaks for the service.
+description = "Capture-first notes app (iOS + web) on a shared Rust core."
 host = "deepwa7er"
 
 [build]
