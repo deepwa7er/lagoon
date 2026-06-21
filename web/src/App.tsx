@@ -28,6 +28,14 @@ export function App() {
 
   const [savedSearches, setSavedSearches] = useState<SavedSearch[]>([]);
 
+  const [hideActioned, setHideActioned] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("buoy.hideActioned") === "true";
+    } catch {
+      return false;
+    }
+  });
+
   // Composer #tag autocomplete: the token under the caret, its suggestions, and
   // the highlighted option.
   const [tagToken, setTagToken] = useState<{ prefix: string; start: number } | null>(null);
@@ -257,6 +265,32 @@ export function App() {
     [reloadSaved],
   );
 
+  const toggleActioned = useCallback(
+    async (t: Thought) => {
+      try {
+        const updated = t.is_actioned
+          ? await api.unmarkActioned(t.id)
+          : await api.markActioned(t.id);
+        setThoughts((ts) => ts.map((th) => (th.id === updated.id ? updated : th)));
+      } catch (e) {
+        setError(String(e instanceof Error ? e.message : e));
+      }
+    },
+    [],
+  );
+
+  const toggleHideActioned = useCallback(() => {
+    setHideActioned((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem("buoy.hideActioned", String(next));
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  }, []);
+
   const pinSearch = useCallback(async () => {
     const q = query.trim();
     if (!q) return;
@@ -443,19 +477,22 @@ export function App() {
                 nothing captured yet — write your first thought above
               </li>
             )}
-            {thoughts.map((t) => (
-              <ThoughtRow
-                key={t.id}
-                thought={t}
-                editing={editingId === t.id}
-                related={related[t.id]}
-                onEdit={startEdit}
-                onDelete={(id) => void remove(id)}
-                onToggleRelated={(th) => void toggleRelated(th)}
-                onPick={reveal}
-                onTagClick={onTagClick}
-              />
-            ))}
+            {thoughts
+              .filter((t) => !hideActioned || !t.is_actioned)
+              .map((t) => (
+                <ThoughtRow
+                  key={t.id}
+                  thought={t}
+                  editing={editingId === t.id}
+                  related={related[t.id]}
+                  onEdit={startEdit}
+                  onDelete={(id) => void remove(id)}
+                  onToggleRelated={(th) => void toggleRelated(th)}
+                  onPick={reveal}
+                  onTagClick={onTagClick}
+                  onToggleActioned={(th) => void toggleActioned(th)}
+                />
+              ))}
             {loadingMore && <li className="px-4 py-3 text-center text-ink-faint">…</li>}
           </ul>
         )}
@@ -473,7 +510,17 @@ export function App() {
               : `${thoughts.length} loaded`}
           </span>
         )}
-        <span>buoy v0.1.0</span>
+        <div className="flex items-center gap-4">
+          <button
+            type="button"
+            onClick={toggleHideActioned}
+            className={`hover:text-accent ${hideActioned ? "text-accent" : ""}`}
+            title={hideActioned ? "show actioned thoughts" : "hide actioned thoughts"}
+          >
+            {hideActioned ? "show done" : "hide done"}
+          </button>
+          <span>buoy v0.1.0</span>
+        </div>
       </footer>
     </div>
   );

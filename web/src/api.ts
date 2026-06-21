@@ -101,3 +101,11 @@ export function createSavedSearch(name: string, query: string): Promise<SavedSea
 export function deleteSavedSearch(id: string): Promise<void> {
   return request<void>(`/api/saved-searches/${id}`, { method: "DELETE" });
 }
+
+export function markActioned(id: string): Promise<Thought> {
+  return request<Thought>(`/api/thoughts/${id}/mark-actioned`, { method: "POST" });
+}
+
+export function unmarkActioned(id: string): Promise<Thought> {
+  return request<Thought>(`/api/thoughts/${id}/unmark-actioned`, { method: "POST" });
+}

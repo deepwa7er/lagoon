@@ -43,6 +43,8 @@ pub struct Thought {
     /// True when this thought has settled — subsequent edits will create
     /// edit-history entries rather than silently overwriting.
     pub is_settled: bool,
+    /// True when the user has marked this thought as actioned (dealt with).
+    pub is_actioned: bool,
 }
 
 impl From<CoreThought> for Thought {
@@ -53,6 +55,7 @@ impl From<CoreThought> for Thought {
             created_at: value.created_at,
             updated_at: value.updated_at,
             is_settled: value.is_settled,
+            is_actioned: value.is_actioned,
         }
     }
 }
@@ -165,6 +168,7 @@ pub struct ThoughtChange {
     pub updated_at: i64,
     pub settled_at: Option<i64>,
     pub deleted_at: Option<i64>,
+    pub actioned_at: Option<i64>,
 }
 
 impl From<CoreThoughtChange> for ThoughtChange {
@@ -176,6 +180,7 @@ impl From<CoreThoughtChange> for ThoughtChange {
             updated_at: value.updated_at,
             settled_at: value.settled_at,
             deleted_at: value.deleted_at,
+            actioned_at: value.actioned_at,
         }
     }
 }
@@ -189,6 +194,7 @@ impl ThoughtChange {
             updated_at: self.updated_at,
             settled_at: self.settled_at,
             deleted_at: self.deleted_at,
+            actioned_at: self.actioned_at,
         })
     }
 }
@@ -492,5 +498,36 @@ impl ThoughtStore {
         let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
         guard.delete_saved_search(uuid)?;
         Ok(())
+    }
+
+    // ── action tracking ───────────────────────────────────────────────────────
+
+    /// Mark a thought as actioned (dealt with). Sets `actioned_at`, bumps
+    /// `updated_at`, marks dirty so the state propagates on sync. Returns the
+    /// updated thought. Errors with `NotFound` if the thought is absent or deleted.
+    pub fn mark_actioned(&self, id: &str) -> Result<Thought, FfiError> {
+        let uuid = parse_id(id)?;
+        let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
+        Ok(guard.mark_actioned(uuid)?.into())
+    }
+
+    /// Clear the actioned state. Sets `actioned_at = NULL`, bumps `updated_at`,
+    /// marks dirty. Returns the updated thought.
+    pub fn unmark_actioned(&self, id: &str) -> Result<Thought, FfiError> {
+        let uuid = parse_id(id)?;
+        let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
+        Ok(guard.unmark_actioned(uuid)?.into())
+    }
+
+    /// Unactioned thoughts not updated in `older_than_ms` milliseconds, oldest
+    /// first — the "stale inbox" view. A threshold of 7 days in milliseconds
+    /// (`604_800_000`) is a reasonable starting point.
+    pub fn list_stale(&self, older_than_ms: i64, limit: u32) -> Result<Vec<Thought>, FfiError> {
+        let guard = self.inner.lock().expect("ThoughtStore mutex poisoned");
+        Ok(guard
+            .list_stale(older_than_ms, limit as usize)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 }

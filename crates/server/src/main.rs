@@ -96,6 +96,15 @@ async fn main() -> anyhow::Result<()> {
             get(api::list_saved_searches).post(api::create_saved_search),
         )
         .route("/api/saved-searches/{id}", delete(api::delete_saved_search))
+        .route(
+            "/api/thoughts/{id}/mark-actioned",
+            post(api::mark_actioned),
+        )
+        .route(
+            "/api/thoughts/{id}/unmark-actioned",
+            post(api::unmark_actioned),
+        )
+        .route("/api/thoughts/stale", get(api::list_stale))
         .route("/api/sync", post(api::sync))
         .route("/healthz", get(api::healthz))
         .fallback_service(serve_dir)

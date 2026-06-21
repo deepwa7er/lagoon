@@ -21,6 +21,9 @@ pub struct Thought {
     /// will create edit-history entries rather than silently overwriting.
     /// Derived from `settled_at IS NOT NULL OR (now - updated_at > window)`.
     pub is_settled: bool,
+    /// Whether this thought has been marked actioned (dealt with). Derived from
+    /// `actioned_at IS NOT NULL`.
+    pub is_actioned: bool,
 }
 
 /// A historical version of a thought captured when a settled thought is

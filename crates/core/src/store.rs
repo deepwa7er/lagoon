@@ -17,7 +17,7 @@ use crate::sync::{SyncCursor, ThoughtChange};
 use crate::tags::parse_tags;
 use crate::thought::{EditEntry, Thought};
 
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 7;
 
 /// Semantic results below this cosine similarity are dropped: they read as
 /// noise to the user. Initial heuristic calibrated against the Phase 3
@@ -143,6 +143,7 @@ impl ThoughtStore {
             created_at: now,
             updated_at: now,
             is_settled: false,
+            is_actioned: false,
         })
     }
 
@@ -163,16 +164,16 @@ impl ThoughtStore {
         let vector = self.try_embed(new_text);
         let tx = self.conn.unchecked_transaction()?;
 
-        let current: Option<(String, i64, i64, Option<i64>)> = tx
+        let current: Option<(String, i64, i64, Option<i64>, Option<i64>)> = tx
             .query_row(
-                "SELECT text, created_at, updated_at, settled_at
+                "SELECT text, created_at, updated_at, settled_at, actioned_at
                  FROM thoughts WHERE id = ?1 AND deleted_at IS NULL",
                 params![id.as_bytes().as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()?;
 
-        let (prior_text, created_at, prior_updated_at, prior_settled_at) =
+        let (prior_text, created_at, prior_updated_at, prior_settled_at, actioned_at) =
             current.ok_or(Error::NotFound { id })?;
 
         if is_settled_now(prior_updated_at, prior_settled_at, now) {
@@ -217,6 +218,7 @@ impl ThoughtStore {
             created_at,
             updated_at: now,
             is_settled: false,
+            is_actioned: actioned_at.is_some(),
         })
     }
 
@@ -269,7 +271,7 @@ impl ThoughtStore {
     pub fn list(&self) -> Result<Vec<Thought>> {
         let now = now_unix_millis();
         let mut stmt = self.conn.prepare(
-            "SELECT id, text, created_at, updated_at, settled_at
+            "SELECT id, text, created_at, updated_at, settled_at, actioned_at
              FROM thoughts
              WHERE deleted_at IS NULL
              ORDER BY created_at DESC, id DESC",
@@ -289,7 +291,7 @@ impl ThoughtStore {
         let raw = match before {
             None => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, text, created_at, updated_at, settled_at
+                    "SELECT id, text, created_at, updated_at, settled_at, actioned_at
                      FROM thoughts
                      WHERE deleted_at IS NULL
                      ORDER BY created_at DESC, id DESC
@@ -300,7 +302,7 @@ impl ThoughtStore {
             }
             Some(cursor) => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, text, created_at, updated_at, settled_at
+                    "SELECT id, text, created_at, updated_at, settled_at, actioned_at
                      FROM thoughts
                      WHERE deleted_at IS NULL
                        AND (created_at < ?1 OR (created_at = ?1 AND id < ?2))
@@ -381,7 +383,7 @@ impl ThoughtStore {
         };
 
         let mut stmt = self.conn.prepare(
-            "SELECT t.id, t.text, t.created_at, t.updated_at, t.settled_at,
+            "SELECT t.id, t.text, t.created_at, t.updated_at, t.settled_at, t.actioned_at,
                     snippet(thoughts_fts, 0, ?2, ?3, '…', ?4)
              FROM thoughts_fts
              JOIN thoughts t ON t.rowid = thoughts_fts.rowid
@@ -401,7 +403,7 @@ impl ThoughtStore {
         let mut matches = Vec::new();
         while let Some(row) = rows.next()? {
             let raw = parse_thought_row(row)?;
-            let marked_snippet: String = row.get(5)?;
+            let marked_snippet: String = row.get(6)?;
             let (snippet, ranges) = extract_ranges(&marked_snippet);
             matches.push(ThoughtMatch {
                 thought: into_thought(raw, now),
@@ -537,7 +539,8 @@ impl ThoughtStore {
         let now = now_unix_millis();
 
         let mut stmt = self.conn.prepare(
-            "SELECT t.id, t.text, t.created_at, t.updated_at, t.settled_at, e.vector
+            "SELECT t.id, t.text, t.created_at, t.updated_at, t.settled_at, t.actioned_at,
+                    e.vector
              FROM embeddings e
              JOIN thoughts t ON t.id = e.thought_id
              WHERE t.deleted_at IS NULL",
@@ -549,7 +552,7 @@ impl ThoughtStore {
             if Some(raw.0) == exclude {
                 continue;
             }
-            let blob: Vec<u8> = row.get(5)?;
+            let blob: Vec<u8> = row.get(6)?;
             let vector = blob_to_vector(&blob)?;
             if vector.len() != query_vector.len() {
                 return Err(Error::CorruptRow {
@@ -629,7 +632,7 @@ impl ThoughtStore {
     /// first, so a push proceeds in change order.
     pub fn pending_changes(&self, limit: usize) -> Result<Vec<ThoughtChange>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, text, created_at, updated_at, settled_at, deleted_at
+            "SELECT id, text, created_at, updated_at, settled_at, deleted_at, actioned_at
              FROM thoughts
              WHERE dirty = 1
              ORDER BY updated_at ASC, id ASC
@@ -653,7 +656,7 @@ impl ThoughtStore {
         match since {
             None => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, text, created_at, updated_at, settled_at, deleted_at
+                    "SELECT id, text, created_at, updated_at, settled_at, deleted_at, actioned_at
                      FROM thoughts
                      ORDER BY updated_at ASC, id ASC
                      LIMIT ?1",
@@ -663,7 +666,7 @@ impl ThoughtStore {
             }
             Some(cursor) => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, text, created_at, updated_at, settled_at, deleted_at
+                    "SELECT id, text, created_at, updated_at, settled_at, deleted_at, actioned_at
                      FROM thoughts
                      WHERE updated_at > ?1 OR (updated_at = ?1 AND id > ?2)
                      ORDER BY updated_at ASC, id ASC
@@ -713,15 +716,17 @@ impl ThoughtStore {
 
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO thoughts (id, text, created_at, updated_at, settled_at, deleted_at, dirty)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
+            "INSERT INTO thoughts
+                 (id, text, created_at, updated_at, settled_at, deleted_at, actioned_at, dirty)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
              ON CONFLICT(id) DO UPDATE SET
-                 text       = excluded.text,
-                 created_at = excluded.created_at,
-                 updated_at = excluded.updated_at,
-                 settled_at = excluded.settled_at,
-                 deleted_at = excluded.deleted_at,
-                 dirty      = 0",
+                 text        = excluded.text,
+                 created_at  = excluded.created_at,
+                 updated_at  = excluded.updated_at,
+                 settled_at  = excluded.settled_at,
+                 deleted_at  = excluded.deleted_at,
+                 actioned_at = excluded.actioned_at,
+                 dirty       = 0",
             params![
                 id_blob,
                 change.text,
@@ -729,6 +734,7 @@ impl ThoughtStore {
                 change.updated_at,
                 change.settled_at,
                 change.deleted_at,
+                change.actioned_at,
             ],
         )?;
         match vector {
@@ -804,7 +810,7 @@ impl ThoughtStore {
     pub fn thoughts_with_tag(&self, name: &str, limit: usize) -> Result<Vec<Thought>> {
         let now = now_unix_millis();
         let mut stmt = self.conn.prepare(
-            "SELECT th.id, th.text, th.created_at, th.updated_at, th.settled_at
+            "SELECT th.id, th.text, th.created_at, th.updated_at, th.settled_at, th.actioned_at
              FROM thoughts th
              JOIN thought_tags tt ON tt.thought_id = th.id
              JOIN tags t ON t.id = tt.tag_id
@@ -869,6 +875,75 @@ impl ThoughtStore {
             params![id.as_bytes().as_slice()],
         )?;
         Ok(())
+    }
+
+    // ── action tracking ──────────────────────────────────────────────────────
+
+    /// Mark the thought as actioned. Sets `actioned_at = now`, bumps
+    /// `updated_at`, marks dirty so the state propagates on sync. Returns the
+    /// updated thought. `NotFound` if the thought doesn't exist or is deleted.
+    pub fn mark_actioned(&self, id: Uuid) -> Result<Thought> {
+        let now = now_unix_millis();
+        let affected = self.conn.execute(
+            "UPDATE thoughts SET actioned_at = ?1, updated_at = ?1, dirty = 1
+             WHERE id = ?2 AND deleted_at IS NULL",
+            params![now, id.as_bytes().as_slice()],
+        )?;
+        if affected == 0 {
+            return Err(Error::NotFound { id });
+        }
+        self.get_thought(id, now)
+    }
+
+    /// Clear the actioned state. Sets `actioned_at = NULL`, bumps `updated_at`,
+    /// marks dirty. Returns the updated thought. `NotFound` if the thought
+    /// doesn't exist or is deleted.
+    pub fn unmark_actioned(&self, id: Uuid) -> Result<Thought> {
+        let now = now_unix_millis();
+        let affected = self.conn.execute(
+            "UPDATE thoughts SET actioned_at = NULL, updated_at = ?1, dirty = 1
+             WHERE id = ?2 AND deleted_at IS NULL",
+            params![now, id.as_bytes().as_slice()],
+        )?;
+        if affected == 0 {
+            return Err(Error::NotFound { id });
+        }
+        self.get_thought(id, now)
+    }
+
+    /// Unactioned thoughts that haven't been updated in `older_than_ms`
+    /// milliseconds, oldest first — the "stale inbox" view. A threshold of
+    /// `7 * 24 * 60 * 60 * 1000` (7 days) is a reasonable default for callers
+    /// that don't have a more specific need.
+    pub fn list_stale(&self, older_than_ms: i64, limit: usize) -> Result<Vec<Thought>> {
+        let now = now_unix_millis();
+        let threshold = now.saturating_sub(older_than_ms);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, text, created_at, updated_at, settled_at, actioned_at
+             FROM thoughts
+             WHERE deleted_at IS NULL
+               AND actioned_at IS NULL
+               AND updated_at < ?1
+             ORDER BY updated_at ASC, id ASC
+             LIMIT ?2",
+        )?;
+        let mut rows =
+            stmt.query(params![threshold, i64::try_from(limit).unwrap_or(i64::MAX)])?;
+        let raw = collect_thought_rows(&mut rows)?;
+        Ok(raw.into_iter().map(|r| into_thought(r, now)).collect())
+    }
+
+    fn get_thought(&self, id: Uuid, now: i64) -> Result<Thought> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, text, created_at, updated_at, settled_at, actioned_at
+             FROM thoughts WHERE id = ?1 AND deleted_at IS NULL",
+        )?;
+        let mut rows = stmt.query(params![id.as_bytes().as_slice()])?;
+        let raw = collect_thought_rows(&mut rows)?;
+        raw.into_iter()
+            .next()
+            .map(|r| into_thought(r, now))
+            .ok_or(Error::NotFound { id })
     }
 
     fn configure(&self) -> Result<()> {
@@ -991,11 +1066,41 @@ impl ThoughtStore {
             self.migrate_to_v6()?;
         }
 
+        if current < 7 {
+            self.migrate_to_v7()?;
+        }
+
         // Stamp the schema version. `user_version` is a PRAGMA, so we cannot
         // bind it as a parameter; building the statement with an integer
         // literal is safe.
         self.conn
             .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+        Ok(())
+    }
+
+    /// v7: action tracking — `actioned_at INTEGER` column on `thoughts`. NULL
+    /// means unactioned; a timestamp means the user marked it done. Existing
+    /// rows start NULL (unactioned).
+    ///
+    /// Guards against re-applying when the column is already on disk (can happen
+    /// when a test resets `user_version` on a schema that already includes v7 to
+    /// exercise an earlier migration path). SQLite doesn't support
+    /// `ADD COLUMN IF NOT EXISTS`, so we check via `pragma_table_info`.
+    fn migrate_to_v7(&self) -> Result<()> {
+        let already_present: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('thoughts') WHERE name = 'actioned_at'",
+                [],
+                |row| row.get::<_, i32>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            > 0;
+        if !already_present {
+            self.conn
+                .execute_batch("ALTER TABLE thoughts ADD COLUMN actioned_at INTEGER;")?;
+        }
         Ok(())
     }
 
@@ -1036,7 +1141,8 @@ impl ThoughtStore {
     }
 }
 
-type RawThoughtRow = (Uuid, String, i64, i64, Option<i64>);
+// (id, text, created_at, updated_at, settled_at, actioned_at)
+type RawThoughtRow = (Uuid, String, i64, i64, Option<i64>, Option<i64>);
 
 fn collect_thought_rows(rows: &mut rusqlite::Rows<'_>) -> Result<Vec<RawThoughtRow>> {
     let mut out = Vec::new();
@@ -1053,11 +1159,12 @@ fn parse_thought_row(row: &rusqlite::Row<'_>) -> Result<RawThoughtRow> {
     let created_at: i64 = row.get(2)?;
     let updated_at: i64 = row.get(3)?;
     let settled_at: Option<i64> = row.get(4)?;
-    Ok((id, text, created_at, updated_at, settled_at))
+    let actioned_at: Option<i64> = row.get(5)?;
+    Ok((id, text, created_at, updated_at, settled_at, actioned_at))
 }
 
 /// Collect `ThoughtChange` rows from a query selecting
-/// `(id, text, created_at, updated_at, settled_at, deleted_at)`.
+/// `(id, text, created_at, updated_at, settled_at, deleted_at, actioned_at)`.
 fn collect_change_rows(rows: &mut rusqlite::Rows<'_>) -> Result<Vec<ThoughtChange>> {
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
@@ -1069,13 +1176,14 @@ fn collect_change_rows(rows: &mut rusqlite::Rows<'_>) -> Result<Vec<ThoughtChang
             updated_at: row.get(3)?,
             settled_at: row.get(4)?,
             deleted_at: row.get(5)?,
+            actioned_at: row.get(6)?,
         });
     }
     Ok(out)
 }
 
 fn into_thought(
-    (id, text, created_at, updated_at, settled_at): RawThoughtRow,
+    (id, text, created_at, updated_at, settled_at, actioned_at): RawThoughtRow,
     now: i64,
 ) -> Thought {
     Thought {
@@ -1084,6 +1192,7 @@ fn into_thought(
         created_at,
         updated_at,
         is_settled: is_settled_now(updated_at, settled_at, now),
+        is_actioned: actioned_at.is_some(),
     }
 }
 
@@ -1947,6 +2056,7 @@ mod tests {
             updated_at: t.updated_at,
             settled_at: None,
             deleted_at: None,
+            actioned_at: None,
         }
     }
 
@@ -1984,6 +2094,7 @@ mod tests {
             updated_at: 1_000,
             settled_at: None,
             deleted_at: None,
+            actioned_at: None,
         };
         // Absent locally → inserted, and it lands clean (not in the outbox).
         assert!(store.apply_remote(&remote).unwrap());
@@ -2169,6 +2280,7 @@ mod tests {
             updated_at: 1_000,
             settled_at: None,
             deleted_at: None,
+            actioned_at: None,
         };
         store.apply_remote(&remote).unwrap();
         assert_eq!(store.tags_with_prefix("", 10).unwrap(), vec!["frompeer"]);
@@ -2227,5 +2339,145 @@ mod tests {
         // Deleting a missing one is a no-op.
         store.delete_saved_search(Uuid::new_v4()).unwrap();
         assert_eq!(store.list_saved_searches().unwrap().len(), 1);
+    }
+
+    // ── action tracking ──────────────────────────────────────────────────────
+
+    #[test]
+    fn new_thought_is_unactioned() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        let t = store.create("to do").unwrap();
+        assert!(!t.is_actioned);
+    }
+
+    #[test]
+    fn mark_actioned_sets_flag() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        let t = store.create("to do").unwrap();
+        assert!(!t.is_actioned);
+        let actioned = store.mark_actioned(t.id).unwrap();
+        assert!(actioned.is_actioned);
+        assert_eq!(actioned.id, t.id);
+        // Persists through list().
+        assert!(store.list().unwrap()[0].is_actioned);
+    }
+
+    #[test]
+    fn unmark_actioned_clears_flag() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        let t = store.create("done").unwrap();
+        store.mark_actioned(t.id).unwrap();
+        let unactioned = store.unmark_actioned(t.id).unwrap();
+        assert!(!unactioned.is_actioned);
+        assert!(!store.list().unwrap()[0].is_actioned);
+    }
+
+    #[test]
+    fn mark_actioned_unknown_id_returns_not_found() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        let err = store.mark_actioned(Uuid::new_v4()).expect_err("should fail");
+        assert!(matches!(err, Error::NotFound { .. }));
+    }
+
+    #[test]
+    fn unmark_actioned_unknown_id_returns_not_found() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        let err = store.unmark_actioned(Uuid::new_v4()).expect_err("should fail");
+        assert!(matches!(err, Error::NotFound { .. }));
+    }
+
+    #[test]
+    fn mark_actioned_marks_row_dirty_for_sync() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        let t = store.create("item").unwrap();
+        // Simulate a successful push.
+        store.mark_synced(&[(t.id, t.updated_at)]).unwrap();
+        assert!(store.pending_changes(100).unwrap().is_empty());
+        // Marking actioned re-dirties the row.
+        store.mark_actioned(t.id).unwrap();
+        let pending = store.pending_changes(100).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].actioned_at.is_some());
+    }
+
+    #[test]
+    fn actioned_at_propagates_through_sync() {
+        let store_a = ThoughtStore::open_in_memory().unwrap();
+        let store_b = ThoughtStore::open_in_memory().unwrap();
+
+        let t = store_a.create("shared item").unwrap();
+        // Push from A to B.
+        let change = store_a.pending_changes(10).unwrap().remove(0);
+        store_b.apply_remote(&change).unwrap();
+        assert!(!store_b.list().unwrap()[0].is_actioned);
+
+        // A marks it actioned; the change propagates to B.
+        store_a.mark_actioned(t.id).unwrap();
+        let actioned_change = store_a.pending_changes(10).unwrap().remove(0);
+        assert!(actioned_change.actioned_at.is_some());
+        store_b.apply_remote(&actioned_change).unwrap();
+        assert!(store_b.list().unwrap()[0].is_actioned);
+    }
+
+    #[test]
+    fn list_stale_returns_old_unactioned_thoughts() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        // Insert an "old" row directly to avoid the timing dependency.
+        let id = Uuid::new_v4();
+        let old_ts = now_unix_millis() - 10_000; // 10 seconds ago
+        store
+            .conn
+            .execute(
+                "INSERT INTO thoughts (id, text, created_at, updated_at, settled_at)
+                 VALUES (?1, ?2, ?3, ?3, NULL)",
+                params![id.as_bytes().as_slice(), "old item", old_ts],
+            )
+            .unwrap();
+
+        // Threshold of 5 seconds: the 10s-old row qualifies.
+        let stale = store.list_stale(5_000, 10).unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].id, id);
+        assert!(!stale[0].is_actioned);
+    }
+
+    #[test]
+    fn list_stale_excludes_actioned_thoughts() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        let id = Uuid::new_v4();
+        let old_ts = now_unix_millis() - 10_000;
+        store
+            .conn
+            .execute(
+                "INSERT INTO thoughts (id, text, created_at, updated_at, settled_at, actioned_at)
+                 VALUES (?1, ?2, ?3, ?3, NULL, ?3)",
+                params![id.as_bytes().as_slice(), "done", old_ts],
+            )
+            .unwrap();
+
+        // Actioned thoughts never appear in the stale list regardless of age.
+        let stale = store.list_stale(5_000, 10).unwrap();
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn list_stale_excludes_recently_updated_thoughts() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        // A freshly-created thought should not appear (updated_at is now).
+        store.create("fresh").unwrap();
+        // Threshold of 5 minutes; the fresh thought was updated now.
+        let stale = store.list_stale(5 * 60 * 1000, 10).unwrap();
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn update_thought_preserves_actioned_state() {
+        let store = ThoughtStore::open_in_memory().unwrap();
+        let t = store.create("todo").unwrap();
+        store.mark_actioned(t.id).unwrap();
+        // Editing the text should not clear the actioned flag.
+        let updated = store.update_thought(t.id, "todo (revised)").unwrap();
+        assert!(updated.is_actioned);
+        assert!(store.list().unwrap()[0].is_actioned);
     }
 }

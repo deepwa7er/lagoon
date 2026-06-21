@@ -30,6 +30,7 @@ pub struct ThoughtChange {
     pub updated_at: i64,
     pub settled_at: Option<i64>,
     pub deleted_at: Option<i64>,
+    pub actioned_at: Option<i64>,
 }
 
 impl SyncCursor {

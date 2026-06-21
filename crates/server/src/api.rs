@@ -42,6 +42,7 @@ pub struct ThoughtDto {
     pub created_at: i64,
     pub updated_at: i64,
     pub is_settled: bool,
+    pub is_actioned: bool,
 }
 
 impl From<&Thought> for ThoughtDto {
@@ -52,6 +53,7 @@ impl From<&Thought> for ThoughtDto {
             created_at: t.created_at,
             updated_at: t.updated_at,
             is_settled: t.is_settled,
+            is_actioned: t.is_actioned,
         }
     }
 }
@@ -151,6 +153,7 @@ pub struct ThoughtChangeDto {
     pub updated_at: i64,
     pub settled_at: Option<i64>,
     pub deleted_at: Option<i64>,
+    pub actioned_at: Option<i64>,
 }
 
 impl From<&ThoughtChange> for ThoughtChangeDto {
@@ -162,6 +165,7 @@ impl From<&ThoughtChange> for ThoughtChangeDto {
             updated_at: c.updated_at,
             settled_at: c.settled_at,
             deleted_at: c.deleted_at,
+            actioned_at: c.actioned_at,
         }
     }
 }
@@ -176,6 +180,7 @@ impl TryFrom<&ThoughtChangeDto> for ThoughtChange {
             updated_at: d.updated_at,
             settled_at: d.settled_at,
             deleted_at: d.deleted_at,
+            actioned_at: d.actioned_at,
         })
     }
 }
@@ -412,6 +417,48 @@ pub async fn delete_saved_search(
     let id = parse_id(&id)?;
     blocking(store, move |s| s.delete_saved_search(id)).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ── action tracking ───────────────────────────────────────────────────────────
+
+/// `POST /api/thoughts/{id}/mark-actioned` — mark a thought as dealt with.
+pub async fn mark_actioned(
+    State(store): State<Shared>,
+    Path(id): Path<String>,
+) -> Result<Json<ThoughtDto>, AppError> {
+    let id = parse_id(&id)?;
+    let thought = blocking(store, move |s| s.mark_actioned(id)).await?;
+    Ok(Json(ThoughtDto::from(&thought)))
+}
+
+/// `POST /api/thoughts/{id}/unmark-actioned` — clear the actioned flag.
+pub async fn unmark_actioned(
+    State(store): State<Shared>,
+    Path(id): Path<String>,
+) -> Result<Json<ThoughtDto>, AppError> {
+    let id = parse_id(&id)?;
+    let thought = blocking(store, move |s| s.unmark_actioned(id)).await?;
+    Ok(Json(ThoughtDto::from(&thought)))
+}
+
+#[derive(Deserialize)]
+pub struct StaleQuery {
+    pub older_than_ms: Option<i64>,
+    pub limit: Option<usize>,
+}
+
+const DEFAULT_STALE_MS: i64 = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+/// `GET /api/thoughts/stale?older_than_ms=&limit=` — unactioned thoughts that
+/// haven't been updated in `older_than_ms` milliseconds, oldest first.
+pub async fn list_stale(
+    State(store): State<Shared>,
+    Query(q): Query<StaleQuery>,
+) -> Result<Json<Vec<ThoughtDto>>, AppError> {
+    let older_than_ms = q.older_than_ms.unwrap_or(DEFAULT_STALE_MS);
+    let limit = q.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+    let thoughts = blocking(store, move |s| s.list_stale(older_than_ms, limit)).await?;
+    Ok(Json(thoughts.iter().map(ThoughtDto::from).collect()))
 }
 
 #[derive(Deserialize)]

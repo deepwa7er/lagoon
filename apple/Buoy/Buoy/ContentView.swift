@@ -347,6 +347,23 @@ final class ThoughtListModel {
         await loadSavedSearches()
     }
 
+    // ── action tracking ───────────────────────────────────────────────────────
+
+    func toggleActioned(_ thought: Thought) async {
+        guard let store else { return }
+        do {
+            let updated = thought.isActioned
+                ? try store.unmarkActioned(id: thought.id)
+                : try store.markActioned(id: thought.id)
+            if let idx = thoughts.firstIndex(where: { $0.id == thought.id }) {
+                thoughts[idx] = updated
+            }
+            syncNow()
+        } catch {
+            errorMessage = "Failed to update thought: \(error.localizedDescription)"
+        }
+    }
+
     /// Debounced `#tag` autocomplete for the tag being typed at the end of the
     /// draft. Empties the suggestions when there's no in-progress tag token.
     func suggestTagsDebounced(draft: String) {
@@ -410,6 +427,7 @@ struct ContentView: View {
     @State private var pinName = ""
     @FocusState private var composerFocused: Bool
     @Environment(\.scenePhase) private var scenePhase
+    @AppStorage("buoy.hideActioned") private var hideActioned = false
     #if os(macOS)
     @State private var keyMonitor: Any?
     #endif
@@ -473,6 +491,17 @@ struct ContentView: View {
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     SyncStatusButton(model: model)
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        hideActioned.toggle()
+                    } label: {
+                        Image(
+                            systemName: hideActioned
+                                ? "checkmark.circle.fill" : "checkmark.circle"
+                        )
+                    }
+                    .help(hideActioned ? "Show actioned thoughts" : "Hide actioned thoughts")
                 }
                 ToolbarItem(placement: .primaryAction) {
                     if !searchText.isEmpty {
@@ -558,15 +587,19 @@ struct ContentView: View {
     }
 
     private var stream: some View {
-        ScrollViewReader { proxy in
+        let displayed = model.thoughts.filter { !hideActioned || !$0.isActioned }
+        return ScrollViewReader { proxy in
             List {
-                ForEach(Array(model.thoughts.reversed()), id: \.id) { thought in
+                ForEach(Array(displayed.reversed()), id: \.id) { thought in
                     VStack(alignment: .leading, spacing: 0) {
                         ThoughtRow(
                             thought: thought,
                             relatedExpanded: model.relatedExpanded[thought.id] != nil,
                             onToggleRelated: {
                                 Task { await model.toggleRelated(for: thought) }
+                            },
+                            onToggleActioned: {
+                                Task { await model.toggleActioned(thought) }
                             }
                         )
                         .contentShape(Rectangle())
@@ -922,10 +955,12 @@ private struct ThoughtRow: View {
     let thought: Thought
     let relatedExpanded: Bool
     let onToggleRelated: () -> Void
+    let onToggleActioned: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(taggedText(thought.text))
+                .strikethrough(thought.isActioned, color: .secondary)
             HStack(spacing: 5) {
                 if !thought.isSettled {
                     Circle()
@@ -952,6 +987,25 @@ private struct ThoughtRow: View {
             }
         }
         .padding(.vertical, 4)
+        .opacity(thought.isActioned ? 0.45 : 1.0)
+        .swipeActions(edge: .leading, allowsFullSwipe: true) {
+            Button(action: onToggleActioned) {
+                Label(
+                    thought.isActioned ? "Undo" : "Done",
+                    systemImage: thought.isActioned
+                        ? "arrow.uturn.left.circle" : "checkmark.circle"
+                )
+            }
+            .tint(thought.isActioned ? .orange : .green)
+        }
+        .contextMenu {
+            Button(action: onToggleActioned) {
+                Label(
+                    thought.isActioned ? "Mark as Not Done" : "Mark as Done",
+                    systemImage: thought.isActioned ? "arrow.uturn.left.circle" : "checkmark.circle"
+                )
+            }
+        }
     }
 }
 

@@ -15,6 +15,7 @@ export function ThoughtRow({
   onToggleRelated,
   onPick,
   onTagClick,
+  onToggleActioned,
 }: {
   thought: Thought;
   editing: boolean;
@@ -24,12 +25,14 @@ export function ThoughtRow({
   onToggleRelated: (t: Thought) => void;
   onPick: (id: string) => void;
   onTagClick: (tag: string) => void;
+  onToggleActioned: (t: Thought) => void;
 }) {
   const open = related !== undefined;
+  const actioned = thought.is_actioned;
   return (
     <li
       id={`t-${thought.id}`}
-      className={`border-b border-rule px-4 py-2.5 ${editing ? "bg-surface-2" : ""}`}
+      className={`border-b border-rule px-4 py-2.5 ${editing ? "bg-surface-2" : ""} ${actioned ? "opacity-40" : ""}`}
     >
       <div className="flex items-start gap-3">
         {/* Live/settled: a flat amber square marks a still-mutable thought. */}
@@ -41,7 +44,7 @@ export function ThoughtRow({
             the explicit "edit" action below covers keyboard users. */}
         <div
           onClick={() => onEdit(thought)}
-          className="flex-1 cursor-text whitespace-pre-wrap break-words text-left text-ink"
+          className={`flex-1 cursor-text whitespace-pre-wrap break-words text-left text-ink ${actioned ? "line-through decoration-ink-faint" : ""}`}
           title="edit"
         >
           <TaggedText text={thought.text} onTagClick={onTagClick} />
@@ -60,6 +63,14 @@ export function ThoughtRow({
             className={`hover:text-accent ${open ? "text-accent" : ""}`}
           >
             rel
+          </button>
+          <button
+            type="button"
+            onClick={() => onToggleActioned(thought)}
+            className={`hover:text-accent ${actioned ? "text-accent" : ""}`}
+            title={actioned ? "mark as not done" : "mark as done"}
+          >
+            done
           </button>
           <button type="button" onClick={() => onEdit(thought)} className="hover:text-accent">
             edit

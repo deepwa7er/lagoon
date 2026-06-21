@@ -30,6 +30,7 @@ struct WireChange: Codable {
     let updatedAt: Int64
     let settledAt: Int64?
     let deletedAt: Int64?
+    let actionedAt: Int64?
 
     init(_ c: ThoughtChange) {
         id = c.id
@@ -38,12 +39,13 @@ struct WireChange: Codable {
         updatedAt = c.updatedAt
         settledAt = c.settledAt
         deletedAt = c.deletedAt
+        actionedAt = c.actionedAt
     }
 
     var core: ThoughtChange {
         ThoughtChange(
             id: id, text: text, createdAt: createdAt, updatedAt: updatedAt,
-            settledAt: settledAt, deletedAt: deletedAt)
+            settledAt: settledAt, deletedAt: deletedAt, actionedAt: actionedAt)
     }
 }
 

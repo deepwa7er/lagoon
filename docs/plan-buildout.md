@@ -324,6 +324,36 @@ the Apple sync URL pointed at the now-dead `tailnet:8092` and now uses
 
 **Goal:** Distinguish thoughts that still need action from those that don't.
 
+### Realized (2026-06-20) — complete across core + server + web + Apple
+
+- **Core (schema v7):** `actioned_at INTEGER` column on `thoughts`; `is_actioned:
+  bool` derived field on `Thought` (NULL → false). `mark_actioned(id)` and
+  `unmark_actioned(id)` both set/clear `actioned_at`, bump `updated_at`, and mark
+  `dirty = 1` so the state propagates in the LWW sync feed. `list_stale(older_than_ms,
+  limit)` surfaces unactioned thoughts not updated in N ms, oldest first. The v7
+  migration guards against duplicate `ADD COLUMN` on stores where `user_version`
+  was manually reset (using `pragma_table_info` check). ThoughtChange gains
+  `actioned_at: Option<i64>` so the field is fully sync-able. 11 new core tests
+  (93 total green).
+- **Server + FFI:** `is_actioned` on `ThoughtDto`, `actioned_at` on
+  `ThoughtChangeDto`; `POST /api/thoughts/{id}/mark-actioned`,
+  `POST /api/thoughts/{id}/unmark-actioned`, `GET /api/thoughts/stale`; matching
+  UniFFI exports (`markActioned`, `unmarkActioned`, `listStale`).
+- **Web:** "done" button per row toggles actioned state. Actioned rows are visually
+  faded (`opacity-40`) with strikethrough. A "hide done / show done" toggle in the
+  footer persists across sessions via localStorage. `ThoughtDto.is_actioned` threaded
+  from API through types → App → ThoughtRow. Web frontend builds clean.
+- **Apple (iOS + macOS):** leading swipe-to-done (green checkmark; swipe left on
+  actioned to undo, orange arrow). Actioned rows render at 45% opacity with
+  strikethrough. A toolbar button (checkmark.circle) toggles hide-actioned, persisted
+  via `@AppStorage`. The toggle action (mark/unmark) syncs immediately via
+  `syncNow()`. iOS + macOS build from the same SwiftUI; xcframework rebuilt. iOS
+  26.5 simulator build: `BUILD SUCCEEDED`.
+
+**Phase-boundary audit (passed):** no hacks; mark/unmark propagates through sync
+(LWW on `updated_at`); actioned_at rides the existing sync feed with zero new
+protocol changes; all 93 core tests green; web frontend and iOS both build.
+
 ### Rust core work
 - `actioned_at: Option<i64>` field on `Thought`
 - `mark_actioned(id)` / `unmark_actioned(id)`
@@ -337,9 +367,9 @@ the Apple sync URL pointed at the now-dead `tailnet:8092` and now uses
 - Gentle stale-thought surface — opt-in setting, configurable threshold
 
 ### Acceptance criteria
-- [ ] One-tap mark-as-actioned on all platforms
-- [ ] Filter toggles persist
-- [ ] Stale surface is opt-in and not annoying
+- [x] One-tap mark-as-actioned on all platforms
+- [x] Filter toggles persist
+- [ ] Stale surface is opt-in and not annoying (list_stale endpoint exists; no dedicated UI surface yet)
 
 ---
 

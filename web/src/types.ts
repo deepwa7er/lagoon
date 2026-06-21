@@ -7,6 +7,8 @@ export interface Thought {
   created_at: number;
   updated_at: number;
   is_settled: boolean;
+  /** Whether the user has marked this thought as dealt with. */
+  is_actioned: boolean;
 }
 
 export interface MatchRange {
