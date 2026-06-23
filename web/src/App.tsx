@@ -460,13 +460,20 @@ export function App() {
             )}
             {results.map((m) => (
               <li key={m.thought.id} className="border-b border-rule px-4 py-2.5">
-                <button
-                  type="button"
-                  onClick={() => startEdit(m.thought)}
-                  className="w-full whitespace-pre-wrap break-words text-left text-ink"
-                >
-                  <Snippet snippet={m.snippet} ranges={m.ranges} />
-                </button>
+                <div className="flex items-start gap-3">
+                  {/* Selectable text so a result can be read and copied; editing
+                      is an explicit action via the "edit" button. */}
+                  <div className="flex-1 cursor-text whitespace-pre-wrap break-words text-left text-ink">
+                    <Snippet snippet={m.snippet} ranges={m.ranges} />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => startEdit(m.thought)}
+                    className="shrink-0 pt-px text-[11px] uppercase tracking-wide text-ink-faint hover:text-accent"
+                  >
+                    edit
+                  </button>
+                </div>
               </li>
             ))}
           </ul>
