@@ -40,12 +40,12 @@ export function ThoughtRow({
           className={`mt-1.5 size-2 shrink-0 ${thought.is_settled ? "bg-transparent" : "bg-accent"}`}
           title={thought.is_settled ? "settled" : "live — edits overwrite until it settles"}
         />
-        {/* A div (not a button) so the inline tag chips aren't nested buttons;
-            the explicit "edit" action below covers keyboard users. */}
+        {/* The note body is selectable text, not an edit trigger, so it can be
+            read and copied freely; editing is an explicit action via the "edit"
+            button. A div (not a button) keeps the inline tag chips from nesting
+            inside a button. */}
         <div
-          onClick={() => onEdit(thought)}
           className={`flex-1 cursor-text whitespace-pre-wrap break-words text-left text-ink ${actioned ? "line-through decoration-ink-faint" : ""}`}
-          title="edit"
         >
           <TaggedText text={thought.text} onTagClick={onTagClick} />
         </div>

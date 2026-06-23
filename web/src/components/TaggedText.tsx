@@ -2,7 +2,8 @@ import { segmentTags } from "../lib/tags";
 
 /**
  * Render thought text with its `#tag` tokens as clickable chips. Tag clicks
- * stop propagation so they don't also trigger the row's edit affordance.
+ * stop propagation so a tag click only ever filters — never anything the
+ * surrounding row might attach to the click.
  */
 export function TaggedText({
   text,
