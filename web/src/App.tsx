@@ -397,6 +397,10 @@ export function App() {
         <div className="relative">
           <textarea
             ref={textareaRef}
+            // Capture-first: land the caret in the composer on page load so the
+            // user can start typing immediately. Only fires on mount, which is
+            // exactly "new thought" mode (no thought is being edited yet).
+            autoFocus
             value={draft}
             onChange={(e) => {
               setDraft(e.target.value);
