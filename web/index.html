@@ -1,9 +1,20 @@
 <!doctype html>
-<html lang="en" class="dark">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark light" />
+    <script>
+      // First-paint fleet theme from the shared cookie (no flash); theme.ts then
+      // syncs from tide and polls. See web/src/lib/theme.ts.
+      try {
+        var m = document.cookie.match(/(?:^|; )fleet_theme=(dark|light)/);
+        var t = m ? m[1] : "dark";
+        var e = document.documentElement;
+        e.dataset.theme = t;
+        e.style.colorScheme = t;
+      } catch (_) {}
+    </script>
     <title>lagoon</title>
   </head>
   <body>

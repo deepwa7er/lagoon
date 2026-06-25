@@ -29,6 +29,26 @@
   --color-mark: #3a2c0a;
 }
 
+/* DG-001 light — the shared fleet light palette (tide flips html[data-theme]).
+ * Same tokens, paper values; amber accent darkened for contrast on white, and
+ * the search-highlight wash becomes a light yellow. */
+html[data-theme="light"] {
+  --color-bg: #f4f3ee;
+  --color-surface: #ffffff;
+  --color-surface-2: #eceae3;
+  --color-ink: #1b1a17;
+  --color-ink-muted: #57544c;
+  --color-ink-faint: #8a8678;
+  --color-rule: #d8d6cd;
+  --color-rule-strong: #bfbcb0;
+
+  --color-accent: #a85d00;
+  --color-active: #2f9e44;
+  --color-failed: #c92a2a;
+  --color-idle: #8a8678;
+  --color-mark: #ffec99;
+}
+
 * {
   box-sizing: border-box;
 }
