@@ -2,7 +2,7 @@
 #
 # `bind` is the address the server listens on. It binds loopback; the breakwater
 # reverse proxy is the tailnet front door and serves lagoon at
-# https://lagoon.internal.deepwa7er.com (nothing is exposed publicly).
+# https://lagoon.intern.deepwa7er.net (nothing is exposed publicly).
 bind = "127.0.0.1"
 port = 8092
 

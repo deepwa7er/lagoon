@@ -299,7 +299,7 @@ no dead code; 82 core tests green. The web flows were browser-verified end to
 end (9/9); the iOS UI was visually verified (full interaction-driving would need
 XCUITest). While here, fixed a regression the breakwater migration introduced —
 the Apple sync URL pointed at the now-dead `tailnet:8092` and now uses
-`https://lagoon.internal.deepwa7er.com`.
+`https://lagoon.intern.deepwa7er.net`.
 
 ### Rust core work
 - `tags` table + `thought_tags` join

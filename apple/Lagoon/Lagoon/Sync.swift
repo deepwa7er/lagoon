@@ -13,7 +13,7 @@ import Foundation
 /// (a valid wildcard cert, so no ATS exception is needed). lagoon binds loopback
 /// on the VPS; breakwater serves it at this name, the same `*.internal` scheme
 /// the web app and the rest of the suite use.
-let lagoonServerURL = URL(string: "https://lagoon.internal.deepwa7er.com")!
+let lagoonServerURL = URL(string: "https://lagoon.intern.deepwa7er.net")!
 
 /// How many local changes to push per sync. A personal store fits in one tick;
 /// if there are more, the next tick drains the rest.
