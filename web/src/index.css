@@ -1,8 +1,8 @@
 @import "tailwindcss";
 
-/* DG-001 (U.S. Graphics school) — dark "terminal" discipline, matching the rest
+/* DG-002 TRITIUM (U.S. Graphics school) — dark "terminal" discipline, matching the rest
  * of the suite (harbor, lighthouse). Monospace-forward, hairline rules, flat
- * fills, sharp corners, a single amber signal accent, a flat functional status
+ * fills, sharp corners, a single LCD-blue accent, a flat functional status
  * ramp. Tokens exposed to Tailwind v4 as utilities (bg-surface, text-ink,
  * border-rule, text-accent, …). No gradients, no glow, no soft shadows. */
 @theme {
@@ -10,41 +10,41 @@
     "Berkeley Mono", "JetBrains Mono", "IBM Plex Mono", ui-monospace,
     SFMono-Regular, Menlo, Consolas, monospace;
 
-  --color-bg: #0b0c0d;
-  --color-surface: #121315;
-  --color-surface-2: #16181a;
-  --color-ink: #e6e4dd;
-  --color-ink-muted: #9a978d;
-  --color-ink-faint: #6a675f;
-  --color-rule: #2a2b2d;
-  --color-rule-strong: #3a3c3e;
+  --color-bg: #000000;
+  --color-surface: #0a0a0a;
+  --color-surface-2: #101010;
+  --color-ink: #00a645;
+  --color-ink-muted: #00753d;
+  --color-ink-faint: #4a4a48;
+  --color-rule: #242424;
+  --color-rule-strong: #3d3d3b;
 
   /* One signal accent — signal blue — means "act / attention", not decor. */
-  --color-accent: #4dabf7;
+  --color-accent: #4a90d4;
   /* Flat functional status ramp. */
-  --color-active: #37b24d;
-  --color-failed: #c92a2a;
-  --color-idle: #6a675f;
+  --color-active: #00a645;
+  --color-failed: #e0281e;
+  --color-idle: #4a4a48;
   /* Search-highlight wash. */
   --color-mark: #3a2c0a;
 }
 
-/* DG-001 light — the shared fleet light palette (tide flips html[data-theme]).
+/* DG-002 TRITIUM light — the shared fleet light palette (tide flips html[data-theme]).
  * Same tokens, paper values; amber accent darkened for contrast on white, and
  * the search-highlight wash becomes a light yellow. */
 html[data-theme="light"] {
   --color-bg: #f4f3ee;
-  --color-surface: #ffffff;
+  --color-surface: #fafaf8;
   --color-surface-2: #eceae3;
-  --color-ink: #1b1a17;
-  --color-ink-muted: #57544c;
+  --color-ink: #00702f;
+  --color-ink-muted: #4d7a5e;
   --color-ink-faint: #8a8678;
   --color-rule: #d8d6cd;
   --color-rule-strong: #bfbcb0;
 
-  --color-accent: #1971c2;
-  --color-active: #2f9e44;
-  --color-failed: #c92a2a;
+  --color-accent: #2a6bb0;
+  --color-active: #00702f;
+  --color-failed: #b3231a;
   --color-idle: #8a8678;
   --color-mark: #ffec99;
 }
