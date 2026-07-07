@@ -19,14 +19,15 @@
   --color-rule: #242424;
   --color-rule-strong: #3d3d3b;
 
-  /* One signal accent — signal blue — means "act / attention", not decor. */
+  /* One signal accent — LCD blue — means "act / attention", not decor. */
   --color-accent: #4a90d4;
   /* Flat functional status ramp. */
   --color-active: #00a645;
   --color-failed: #e0281e;
   --color-idle: #4a4a48;
-  /* Search-highlight wash. */
-  --color-mark: #3a2c0a;
+  /* Search highlight — black-on-amber, the terminal search convention. */
+  --color-mark: #ffbf00;
+  --color-mark-ink: #000000;
 }
 
 /* DG-002 TRITIUM light — the shared fleet light palette (tide flips html[data-theme]).
@@ -47,6 +48,7 @@ html[data-theme="light"] {
   --color-failed: #b3231a;
   --color-idle: #8a8678;
   --color-mark: #ffec99;
+  --color-mark-ink: #1a1a1a;
 }
 
 * {
@@ -102,9 +104,11 @@ button {
   }
 }
 
-/* Search highlight inside a snippet — flat amber wash, no rounding. */
+/* Search highlight inside a snippet — flat amber, no rounding. Ink is its own
+ * token: green text on amber fails contrast, so the mark carries black/near-
+ * black regardless of theme. */
 mark {
   background: var(--color-mark);
-  color: var(--color-ink);
+  color: var(--color-mark-ink);
   padding: 0 1px;
 }
